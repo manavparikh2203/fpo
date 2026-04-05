@@ -41,10 +41,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 try:
-    from IPython.display import clear_output, display
+    from IPython import get_ipython
+    from IPython.display import HTML, display
 except ImportError:  # pragma: no cover
-    clear_output = None
+    HTML = None
     display = None
+    get_ipython = None
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +84,7 @@ class KaggleRunConfig:
     plot_every: int = 1
     save_every: int = 1
     rolling_window: int = 20
+    show_live_plots: bool = True
     output_dir: str = str(REPO_ROOT / "kaggle_outputs" / "fpo_ant_v4")
 
     def make_fpo_config(self) -> fpo.FpoConfig:
@@ -142,6 +145,47 @@ class EpisodeTracker:
         self.returns[done] = 0.0
         self.lengths[done] = 0
         return finished_returns, finished_lengths
+
+
+@dataclass(slots=True)
+class LiveDisplayManager:
+    """Notebook-friendly live display that updates in place."""
+
+    enabled: bool = False
+    figure_handle: Any | None = None
+    status_handle: Any | None = None
+
+    @classmethod
+    def create(cls, enabled: bool) -> "LiveDisplayManager":
+        notebook_enabled = enabled and _is_notebook_runtime()
+        return cls(enabled=notebook_enabled)
+
+    def update(self, fig: plt.Figure, status_text: str) -> None:
+        if self.enabled and display is not None and HTML is not None:
+            status_html = HTML(
+                "<pre style='white-space: pre-wrap; font-family: monospace;'>"
+                f"{status_text}"
+                "</pre>"
+            )
+            if self.figure_handle is None:
+                self.figure_handle = display(fig, display_id=True)
+                self.status_handle = display(status_html, display_id=True)
+            else:
+                self.figure_handle.update(fig)
+                assert self.status_handle is not None
+                self.status_handle.update(status_html)
+            return
+
+        print(status_text, flush=True)
+
+
+def _is_notebook_runtime() -> bool:
+    if get_ipython is None:
+        return False
+    shell = get_ipython()
+    if shell is None:
+        return False
+    return shell.__class__.__name__ == "ZMQInteractiveShell"
 
 
 class GymnasiumBatchEnv:
@@ -395,6 +439,7 @@ def render_live_dashboard(
     train_history: list[dict[str, Any]],
     eval_history: list[dict[str, Any]],
     episode_history: list[dict[str, Any]],
+    live_display: LiveDisplayManager,
     output_dir: Path,
     outer_iter: int,
     outer_iters: int,
@@ -522,15 +567,15 @@ def render_live_dashboard(
     fig.tight_layout()
     fig.savefig(output_dir / "live_training_dashboard.png", dpi=150, bbox_inches="tight")
 
-    if clear_output is not None and display is not None:
-        clear_output(wait=True)
-        display(fig)
-        print(
-            f"iter {outer_iter + 1}/{outer_iters} | "
-            f"env={run_config.env_name} | "
-            f"completed_episodes={len(episode_history)} | "
-            f"output_dir={output_dir}"
-        )
+    status_text = (
+        f"iter {outer_iter + 1}/{outer_iters}\n"
+        f"env={run_config.env_name}\n"
+        f"completed_episodes={len(episode_history)}\n"
+        f"latest_train_mean_step_reward={train_mean_reward[-1]:.4f}\n"
+        f"latest_train_mean_episode_return={train_mean_episode_return[-1]:.4f}\n"
+        f"output_dir={output_dir}"
+    )
+    live_display.update(fig, status_text)
     plt.close(fig)
 
 
@@ -565,6 +610,7 @@ def train_gymnasium_baseline(
     config = run_config.make_fpo_config()
     output_dir = Path(run_config.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    live_display = LiveDisplayManager.create(enabled=run_config.show_live_plots)
 
     train_env = GymnasiumBatchEnv(
         env_name=run_config.env_name,
@@ -675,6 +721,7 @@ def train_gymnasium_baseline(
                     train_history=train_history,
                     eval_history=eval_history,
                     episode_history=episode_history,
+                    live_display=live_display,
                     output_dir=output_dir,
                     outer_iter=outer_iter,
                     outer_iters=outer_iters,
