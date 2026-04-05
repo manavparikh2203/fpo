@@ -75,13 +75,13 @@ class KaggleRunConfig:
 
     env_name: str = "Ant-v4"
     seed: int = 0
-    num_timesteps: int = 1000000
+    num_timesteps: int = 10000000
     num_envs: int = 128
     batch_size: int = 32
     num_minibatches: int = 8
     unroll_length: int = 30
-    num_updates_per_batch: int = 16
-    num_evals: int = 32
+    num_updates_per_batch: int = 32
+    num_evals: int = 64
     eval_num_envs: int = 4
     episode_length: int = 1000
     plot_every: int = 1
