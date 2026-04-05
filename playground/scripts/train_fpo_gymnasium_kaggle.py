@@ -74,13 +74,13 @@ class KaggleRunConfig:
 
     env_name: str = "Ant-v4"
     seed: int = 0
-    num_timesteps: int = 1000000
+    num_timesteps: int = 5000000
     num_envs: int = 128
     batch_size: int = 32
     num_minibatches: int = 8
     unroll_length: int = 30
-    num_updates_per_batch: int = 4
-    num_evals: int = 8
+    num_updates_per_batch: int = 8
+    num_evals: int = 16
     eval_num_envs: int = 4
     episode_length: int = 1000
     plot_every: int = 1
@@ -116,6 +116,49 @@ class KaggleRunConfig:
             num_updates_per_batch=self.num_updates_per_batch,
             num_evals=self.num_evals,
             episode_length=self.episode_length,
+        )
+
+
+@dataclass(slots=True)
+class TrainEpisodeTracker:
+    """Tracks episode returns and lengths across rollout chunks for logging."""
+
+    returns: np.ndarray
+    lengths: np.ndarray
+
+    @classmethod
+    def init(cls, num_envs: int) -> "TrainEpisodeTracker":
+        return cls(
+            returns=np.zeros(num_envs, dtype=np.float32),
+            lengths=np.zeros(num_envs, dtype=np.int32),
+        )
+
+    def update_from_transitions(
+        self,
+        transitions: rollouts.TransitionStruct[Any],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        rewards = np.asarray(jax.device_get(transitions.reward), dtype=np.float32)
+        truncation = np.asarray(jax.device_get(transitions.truncation), dtype=np.float32)
+        discount = np.asarray(jax.device_get(transitions.discount), dtype=np.float32)
+
+        completed_returns: list[float] = []
+        completed_lengths: list[int] = []
+        horizon, _ = rewards.shape
+
+        for t in range(horizon):
+            self.returns += rewards[t]
+            self.lengths += 1
+            done = np.logical_or(truncation[t] > 0.5, discount[t] == 0.0)
+            if not bool(done.any()):
+                continue
+            completed_returns.extend(self.returns[done].astype(np.float32).tolist())
+            completed_lengths.extend(self.lengths[done].astype(np.int32).tolist())
+            self.returns[done] = 0.0
+            self.lengths[done] = 0
+
+        return (
+            np.asarray(completed_returns, dtype=np.float32),
+            np.asarray(completed_lengths, dtype=np.int32),
         )
 
 
@@ -466,35 +509,6 @@ class GymnasiumBatchedRolloutState:
         return next_state, transitions
 
 
-def extract_completed_episode_stats(
-    transitions: rollouts.TransitionStruct[Any],
-) -> tuple[np.ndarray, np.ndarray]:
-    rewards = np.asarray(jax.device_get(transitions.reward), dtype=np.float32)
-    truncation = np.asarray(jax.device_get(transitions.truncation), dtype=np.float32)
-    discount = np.asarray(jax.device_get(transitions.discount), dtype=np.float32)
-
-    episode_returns: list[float] = []
-    episode_lengths: list[int] = []
-    horizon, batch = rewards.shape
-
-    for env_index in range(batch):
-        running_return = 0.0
-        running_length = 0
-        for t in range(horizon):
-            running_return += float(rewards[t, env_index])
-            running_length += 1
-            if truncation[t, env_index] > 0.5 or discount[t, env_index] == 0.0:
-                episode_returns.append(running_return)
-                episode_lengths.append(running_length)
-                running_return = 0.0
-                running_length = 0
-
-    return (
-        np.asarray(episode_returns, dtype=np.float32),
-        np.asarray(episode_lengths, dtype=np.int32),
-    )
-
-
 def gymnasium_eval_policy(
     agent_state: fpo.FpoState,
     env_name: str,
@@ -806,6 +820,7 @@ def train_gymnasium_baseline(
             f"starting run for {run_config.env_name}\n"
             f"num_envs={run_config.num_envs}\n"
             f"num_timesteps={run_config.num_timesteps}\n"
+            f"num_updates_per_batch={run_config.num_updates_per_batch}\n"
             f"jax_backend={compute_backend}\n"
             f"jax_device={compute_device}"
         ),
@@ -881,6 +896,7 @@ def train_gymnasium_baseline(
             f"iterations_per_env={config.iterations_per_env}\n"
             f"requested_num_timesteps={config.num_timesteps}\n"
             f"planned_total_timesteps={planned_total_timesteps}\n"
+            f"num_updates_per_batch={config.num_updates_per_batch}\n"
             f"eval_num_envs={run_config.eval_num_envs}\n"
             f"jax_backend={compute_backend}\n"
             "collecting first rollout next"
@@ -890,6 +906,7 @@ def train_gymnasium_baseline(
     train_history: list[dict[str, Any]] = []
     eval_history: list[dict[str, Any]] = []
     episode_history: list[dict[str, Any]] = []
+    train_episode_tracker = TrainEpisodeTracker.init(run_config.num_envs)
 
     start_time = time.time()
     try:
@@ -972,7 +989,7 @@ def train_gymnasium_baseline(
                 live_display.update_status(phase_status)
             agent_state, metrics = agent_state.training_step(transitions)
 
-            batch_episode_returns, batch_episode_lengths = extract_completed_episode_stats(
+            batch_episode_returns, batch_episode_lengths = train_episode_tracker.update_from_transitions(
                 transitions
             )
             reward_np = np.asarray(jax.device_get(transitions.reward), dtype=np.float32)
