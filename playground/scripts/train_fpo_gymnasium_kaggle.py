@@ -41,6 +41,7 @@ import jax.numpy as jnp
 import jax.tree_util as jtu
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib import gridspec
 
 try:
     from IPython import get_ipython
@@ -607,6 +608,191 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(values, kernel, mode="valid")
 
 
+def plot_metric_panel(
+    ax: plt.Axes,
+    x: np.ndarray,
+    y: np.ndarray,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    rolling_window: int,
+    raw_label: str | None = None,
+    smooth_label: str | None = None,
+    eval_x: np.ndarray | None = None,
+    eval_y: np.ndarray | None = None,
+    eval_label: str | None = None,
+) -> None:
+    if x.size > 0 and y.size > 0:
+        ax.plot(
+            x,
+            y,
+            alpha=0.28,
+            linewidth=1.0,
+            color="#4aa3df",
+            label=raw_label,
+        )
+        if y.size >= 2:
+            smoothed = moving_average(y, min(rolling_window, y.size))
+            smooth_x = x[-smoothed.size :]
+            ax.plot(
+                smooth_x,
+                smoothed,
+                linewidth=2.2,
+                color="#1474b8",
+                label=smooth_label,
+            )
+    else:
+        ax.text(0.5, 0.5, "No data yet", ha="center", va="center", transform=ax.transAxes)
+
+    if eval_x is not None and eval_y is not None and eval_x.size > 0 and eval_y.size > 0:
+        ax.plot(
+            eval_x,
+            eval_y,
+            marker="o",
+            markersize=3.0,
+            linewidth=1.4,
+            color="#d48828",
+            label=eval_label,
+        )
+
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(alpha=0.22)
+    handles, labels = ax.get_legend_handles_labels()
+    if labels:
+        ax.legend(fontsize=7, frameon=False, loc="upper left")
+
+
+def create_dashboard_figure(
+    run_config: KaggleRunConfig,
+    train_history: list[dict[str, Any]],
+    eval_history: list[dict[str, Any]],
+    episode_history: list[dict[str, Any]],
+    elapsed_seconds: float,
+    title_suffix: str,
+) -> plt.Figure:
+    timesteps_per_outer_iter = timesteps_per_outer_iter_from_run_config(run_config)
+    fig = plt.figure(figsize=(18, 12))
+    layout = gridspec.GridSpec(3, 6, figure=fig)
+
+    train_env_steps = np.asarray(
+        [
+            row.get("env_steps", (row["step"] + 1) * timesteps_per_outer_iter)
+            for row in train_history
+        ],
+        dtype=np.int64,
+    )
+    eval_env_steps = np.asarray(
+        [
+            row.get("env_steps", row["step"] * timesteps_per_outer_iter)
+            for row in eval_history
+        ],
+        dtype=np.int64,
+    )
+    episode_env_steps = np.asarray(
+        [row.get("env_steps", row["episode_index"]) for row in episode_history],
+        dtype=np.int64,
+    )
+
+    train_mean_episode_return = np.asarray(
+        [row["mean_completed_episode_return"] for row in train_history],
+        dtype=np.float32,
+    )
+    train_mean_episode_length = np.asarray(
+        [row["mean_completed_episode_length"] for row in train_history],
+        dtype=np.float32,
+    )
+    eval_rewards = np.asarray(
+        [row["reward_mean"] for row in eval_history],
+        dtype=np.float32,
+    )
+    eval_lengths = np.asarray(
+        [row["steps_mean"] for row in eval_history],
+        dtype=np.float32,
+    )
+    episode_returns = np.asarray(
+        [row["episode_return"] for row in episode_history],
+        dtype=np.float32,
+    )
+
+    ax_episode_return = fig.add_subplot(layout[0, :3])
+    plot_metric_panel(
+        ax_episode_return,
+        episode_env_steps,
+        episode_returns,
+        title="sample/episode_return",
+        xlabel="Step",
+        ylabel="return",
+        rolling_window=run_config.rolling_window,
+        raw_label="per-episode return",
+        smooth_label=f"{run_config.rolling_window}-episode average",
+        eval_x=eval_env_steps,
+        eval_y=eval_rewards,
+        eval_label="eval mean return",
+    )
+
+    ax_episode_length = fig.add_subplot(layout[0, 3:])
+    plot_metric_panel(
+        ax_episode_length,
+        train_env_steps,
+        train_mean_episode_length,
+        title="sample/episode_length",
+        xlabel="Step",
+        ylabel="steps",
+        rolling_window=run_config.rolling_window,
+        raw_label="train completed episode length",
+        smooth_label=f"{run_config.rolling_window}-step average",
+        eval_x=eval_env_steps,
+        eval_y=eval_lengths,
+        eval_label="eval mean length",
+    )
+
+    update_metrics = (
+        ("advantages_std", "update/advantages_std", "std"),
+        ("advantages_mean", "update/advantages_mean", "mean"),
+        ("value_std", "update/value_std", "std"),
+        ("value_mean", "update/value_mean", "mean"),
+        ("policy_ratio_mean", "update/policy_ratio_mean", "ratio"),
+        ("clipped_ratio_mean", "update/clipped_ratio_mean", "fraction"),
+    )
+    update_axes = [
+        fig.add_subplot(layout[1, :2]),
+        fig.add_subplot(layout[1, 2:4]),
+        fig.add_subplot(layout[1, 4:]),
+        fig.add_subplot(layout[2, :2]),
+        fig.add_subplot(layout[2, 2:4]),
+        fig.add_subplot(layout[2, 4:]),
+    ]
+
+    for ax, (metric_key, title, ylabel) in zip(update_axes, update_metrics, strict=False):
+        metric_values = np.asarray(
+            [row.get(metric_key, np.nan) for row in train_history],
+            dtype=np.float32,
+        )
+        plot_metric_panel(
+            ax,
+            train_env_steps,
+            metric_values,
+            title=title,
+            xlabel="Step",
+            ylabel=ylabel,
+            rolling_window=max(run_config.rolling_window, 10),
+            raw_label=metric_key,
+            smooth_label=f"{metric_key} trend",
+        )
+
+    fig.suptitle(
+        (
+            f"FPO baseline on {run_config.env_name} | "
+            f"{title_suffix} | elapsed {elapsed_seconds / 60.0:.1f} min"
+        ),
+        fontsize=14,
+    )
+    fig.tight_layout()
+    return fig
+
+
 def write_csv_rows(path: Path, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -689,153 +875,26 @@ def render_live_dashboard(
     outer_iters: int,
     elapsed_seconds: float,
 ) -> None:
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    timesteps_per_outer_iter = timesteps_per_outer_iter_from_run_config(run_config)
-
-    train_steps = np.asarray([row["step"] for row in train_history], dtype=np.int32)
-    train_env_steps = np.asarray(
-        [
-            row.get("env_steps", (row["step"] + 1) * timesteps_per_outer_iter)
-            for row in train_history
-        ],
-        dtype=np.int64,
+    fig = create_dashboard_figure(
+        run_config=run_config,
+        train_history=train_history,
+        eval_history=eval_history,
+        episode_history=episode_history,
+        elapsed_seconds=elapsed_seconds,
+        title_suffix=f"iter {outer_iter + 1}/{outer_iters}",
     )
-    train_mean_reward = np.asarray(
-        [row["mean_step_reward"] for row in train_history],
-        dtype=np.float32,
-    )
-    train_mean_episode_return = np.asarray(
-        [row["mean_completed_episode_return"] for row in train_history],
-        dtype=np.float32,
-    )
-    train_mean_episode_length = np.asarray(
-        [row["mean_completed_episode_length"] for row in train_history],
-        dtype=np.float32,
-    )
-
-    eval_steps = np.asarray([row["step"] for row in eval_history], dtype=np.int32)
-    eval_env_steps = np.asarray(
-        [
-            row.get("env_steps", row["step"] * timesteps_per_outer_iter)
-            for row in eval_history
-        ],
-        dtype=np.int64,
-    )
-    eval_rewards = np.asarray(
-        [row["reward_mean"] for row in eval_history],
-        dtype=np.float32,
-    )
-    eval_lengths = np.asarray(
-        [row["steps_mean"] for row in eval_history],
-        dtype=np.float32,
-    )
-
-    axes[0, 0].plot(
-        train_env_steps,
-        train_mean_reward,
-        label="train mean step reward",
-    )
-    axes[0, 0].plot(
-        train_env_steps,
-        train_mean_episode_return,
-        label="train mean completed episode return",
-    )
-    if eval_history:
-        axes[0, 0].plot(
-            eval_env_steps,
-            eval_rewards,
-            marker="o",
-            label="eval mean episode return",
-        )
-    axes[0, 0].set_title("Reward And Return")
-    axes[0, 0].set_xlabel("env steps")
-    axes[0, 0].set_ylabel("reward")
-    axes[0, 0].legend()
-    axes[0, 0].grid(alpha=0.2)
-
-    episode_env_steps = np.asarray(
-        [row.get("env_steps", row["episode_index"]) for row in episode_history],
-        dtype=np.int64,
-    )
-    episode_returns = np.asarray(
-        [row["episode_return"] for row in episode_history],
-        dtype=np.float32,
-    )
-    if episode_history:
-        axes[0, 1].plot(
-            episode_env_steps,
-            episode_returns,
-            alpha=0.35,
-            label="per-episode return",
-        )
-        smoothed = moving_average(episode_returns, run_config.rolling_window)
-        smooth_x = episode_env_steps[-smoothed.size :]
-        axes[0, 1].plot(
-            smooth_x,
-            smoothed,
-            linewidth=2.0,
-            label=f"{run_config.rolling_window}-episode moving average",
-        )
-    else:
-        axes[0, 1].text(0.5, 0.5, "No completed episodes yet", ha="center", va="center")
-    axes[0, 1].set_title("Live Episode Returns Vs Env Steps")
-    axes[0, 1].set_xlabel("env steps")
-    axes[0, 1].set_ylabel("return")
-    if episode_history:
-        axes[0, 1].legend()
-    axes[0, 1].grid(alpha=0.2)
-
-    axes[1, 0].plot(
-        train_env_steps,
-        train_mean_episode_length,
-        label="train mean completed episode length",
-    )
-    if eval_history:
-        axes[1, 0].plot(
-            eval_env_steps,
-            eval_lengths,
-            marker="o",
-            label="eval mean episode length",
-        )
-    axes[1, 0].set_title("Episode Length")
-    axes[1, 0].set_xlabel("env steps")
-    axes[1, 0].set_ylabel("steps")
-    axes[1, 0].legend()
-    axes[1, 0].grid(alpha=0.2)
-
-    policy_loss = np.asarray(
-        [row["policy_loss"] for row in train_history],
-        dtype=np.float32,
-    )
-    value_loss = np.asarray(
-        [row["v_loss"] for row in train_history],
-        dtype=np.float32,
-    )
-    axes[1, 1].plot(train_env_steps, policy_loss, label="policy_loss")
-    axes[1, 1].plot(train_env_steps, value_loss, label="v_loss")
-    axes[1, 1].set_title("Optimization")
-    axes[1, 1].set_xlabel("env steps")
-    axes[1, 1].set_ylabel("loss")
-    axes[1, 1].legend()
-    axes[1, 1].grid(alpha=0.2)
-
-    fig.suptitle(
-        (
-            f"FPO baseline on {run_config.env_name} | "
-            f"iter {outer_iter + 1}/{outer_iters} | "
-            f"elapsed {elapsed_seconds / 60.0:.1f} min"
-        ),
-        fontsize=14,
-    )
-    fig.tight_layout()
     fig.savefig(output_dir / "live_training_dashboard.png", dpi=150, bbox_inches="tight")
 
+    latest_train_mean_step_reward = float(train_history[-1]["mean_step_reward"])
+    latest_train_mean_episode_return = float(
+        train_history[-1]["mean_completed_episode_return"]
+    )
     status_text = (
         f"iter {outer_iter + 1}/{outer_iters}\n"
         f"env={run_config.env_name}\n"
         f"completed_episodes={len(episode_history)}\n"
-        f"latest_train_mean_step_reward={train_mean_reward[-1]:.4f}\n"
-        f"latest_train_mean_episode_return={train_mean_episode_return[-1]:.4f}\n"
+        f"latest_train_mean_step_reward={latest_train_mean_step_reward:.4f}\n"
+        f"latest_train_mean_episode_return={latest_train_mean_episode_return:.4f}\n"
         f"output_dir={output_dir}"
     )
     live_display.update(fig, status_text)
@@ -855,140 +914,17 @@ def render_final_plots(
     if not train_history:
         return {}
 
-    timesteps_per_outer_iter = config.iterations_per_env * config.num_envs
-    train_env_steps = np.asarray(
-        [
-            row.get("env_steps", (row["step"] + 1) * timesteps_per_outer_iter)
-            for row in train_history
-        ],
-        dtype=np.int64,
-    )
-    train_mean_reward = np.asarray(
-        [row["mean_step_reward"] for row in train_history],
-        dtype=np.float32,
-    )
-    train_mean_episode_return = np.asarray(
-        [row["mean_completed_episode_return"] for row in train_history],
-        dtype=np.float32,
-    )
-    train_mean_episode_length = np.asarray(
-        [row["mean_completed_episode_length"] for row in train_history],
-        dtype=np.float32,
-    )
-
-    eval_env_steps = np.asarray(
-        [
-            row.get("env_steps", row["step"] * timesteps_per_outer_iter)
-            for row in eval_history
-        ],
-        dtype=np.int64,
-    )
-    eval_rewards = np.asarray(
-        [row["reward_mean"] for row in eval_history],
-        dtype=np.float32,
-    )
-    eval_lengths = np.asarray(
-        [row["steps_mean"] for row in eval_history],
-        dtype=np.float32,
-    )
-
-    episode_env_steps = np.asarray(
-        [row.get("env_steps", row["episode_index"]) for row in episode_history],
-        dtype=np.int64,
-    )
-    episode_returns = np.asarray(
-        [row["episode_return"] for row in episode_history],
-        dtype=np.float32,
-    )
-
     dashboard_path = output_dir / "final_training_dashboard.png"
     reward_plot_path = output_dir / "reward_return_vs_env_steps.png"
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    axes[0, 0].plot(train_env_steps, train_mean_reward, label="train mean step reward")
-    axes[0, 0].plot(
-        train_env_steps,
-        train_mean_episode_return,
-        label="train mean completed episode return",
+    fig = create_dashboard_figure(
+        run_config=run_config,
+        train_history=train_history,
+        eval_history=eval_history,
+        episode_history=episode_history,
+        elapsed_seconds=elapsed_seconds,
+        title_suffix="final summary",
     )
-    if eval_history:
-        axes[0, 0].plot(
-            eval_env_steps,
-            eval_rewards,
-            marker="o",
-            label="eval mean episode return",
-        )
-    axes[0, 0].set_title("Reward And Return Vs Env Steps")
-    axes[0, 0].set_xlabel("env steps")
-    axes[0, 0].set_ylabel("reward")
-    axes[0, 0].legend()
-    axes[0, 0].grid(alpha=0.2)
-
-    if episode_history:
-        axes[0, 1].plot(
-            episode_env_steps,
-            episode_returns,
-            alpha=0.35,
-            label="per-episode return",
-        )
-        smoothed = moving_average(episode_returns, run_config.rolling_window)
-        smooth_x = episode_env_steps[-smoothed.size :]
-        axes[0, 1].plot(
-            smooth_x,
-            smoothed,
-            linewidth=2.0,
-            label=f"{run_config.rolling_window}-episode moving average",
-        )
-        axes[0, 1].legend()
-    else:
-        axes[0, 1].text(0.5, 0.5, "No completed episodes yet", ha="center", va="center")
-    axes[0, 1].set_title("Episode Return Vs Env Steps")
-    axes[0, 1].set_xlabel("env steps")
-    axes[0, 1].set_ylabel("return")
-    axes[0, 1].grid(alpha=0.2)
-
-    axes[1, 0].plot(
-        train_env_steps,
-        train_mean_episode_length,
-        label="train mean completed episode length",
-    )
-    if eval_history:
-        axes[1, 0].plot(
-            eval_env_steps,
-            eval_lengths,
-            marker="o",
-            label="eval mean episode length",
-        )
-    axes[1, 0].set_title("Episode Length Vs Env Steps")
-    axes[1, 0].set_xlabel("env steps")
-    axes[1, 0].set_ylabel("steps")
-    axes[1, 0].legend()
-    axes[1, 0].grid(alpha=0.2)
-
-    policy_loss = np.asarray(
-        [row["policy_loss"] for row in train_history],
-        dtype=np.float32,
-    )
-    value_loss = np.asarray(
-        [row["v_loss"] for row in train_history],
-        dtype=np.float32,
-    )
-    axes[1, 1].plot(train_env_steps, policy_loss, label="policy_loss")
-    axes[1, 1].plot(train_env_steps, value_loss, label="v_loss")
-    axes[1, 1].set_title("Optimization Vs Env Steps")
-    axes[1, 1].set_xlabel("env steps")
-    axes[1, 1].set_ylabel("loss")
-    axes[1, 1].legend()
-    axes[1, 1].grid(alpha=0.2)
-
-    fig.suptitle(
-        (
-            f"FPO baseline on {run_config.env_name} | "
-            f"final summary | elapsed {elapsed_seconds / 60.0:.1f} min"
-        ),
-        fontsize=14,
-    )
-    fig.tight_layout()
     fig.savefig(dashboard_path, dpi=150, bbox_inches="tight")
     live_display.update(
         fig,
@@ -1002,25 +938,44 @@ def render_final_plots(
     )
     plt.close(fig)
 
-    reward_fig, reward_ax = plt.subplots(figsize=(11, 6))
-    reward_ax.plot(train_env_steps, train_mean_reward, label="train mean step reward")
-    reward_ax.plot(
+    timesteps_per_outer_iter = config.iterations_per_env * config.num_envs
+    train_env_steps = np.asarray(
+        [
+            row.get("env_steps", (row["step"] + 1) * timesteps_per_outer_iter)
+            for row in train_history
+        ],
+        dtype=np.int64,
+    )
+    eval_env_steps = np.asarray(
+        [
+            row.get("env_steps", row["step"] * timesteps_per_outer_iter)
+            for row in eval_history
+        ],
+        dtype=np.int64,
+    )
+    train_mean_episode_return = np.asarray(
+        [row["mean_completed_episode_return"] for row in train_history],
+        dtype=np.float32,
+    )
+    eval_rewards = np.asarray(
+        [row["reward_mean"] for row in eval_history],
+        dtype=np.float32,
+    )
+    reward_fig, reward_ax = plt.subplots(figsize=(12, 6))
+    plot_metric_panel(
+        reward_ax,
         train_env_steps,
         train_mean_episode_return,
-        label="train mean completed episode return",
+        title=f"sample/episode_return | {run_config.env_name}",
+        xlabel="Step",
+        ylabel="return",
+        rolling_window=run_config.rolling_window,
+        raw_label="train completed episode return",
+        smooth_label=f"{run_config.rolling_window}-window return",
+        eval_x=eval_env_steps,
+        eval_y=eval_rewards,
+        eval_label="eval mean return",
     )
-    if eval_history:
-        reward_ax.plot(
-            eval_env_steps,
-            eval_rewards,
-            marker="o",
-            label="eval mean episode return",
-        )
-    reward_ax.set_title(f"Reward And Return Vs Env Steps | {run_config.env_name}")
-    reward_ax.set_xlabel("env steps")
-    reward_ax.set_ylabel("reward")
-    reward_ax.legend()
-    reward_ax.grid(alpha=0.2)
     reward_fig.tight_layout()
     reward_fig.savefig(reward_plot_path, dpi=150, bbox_inches="tight")
     plt.close(reward_fig)
