@@ -21,7 +21,6 @@ The live plots refresh in that same output cell during training.
 from __future__ import annotations
 
 import base64
-import math
 import csv
 import dataclasses
 import io
@@ -77,7 +76,7 @@ class KaggleRunConfig:
     seed: int = 0
     num_timesteps: int = 1000000
     num_envs: int = 128
-    batch_size: int = 64
+    batch_size: int = 32
     num_minibatches: int = 8
     unroll_length: int = 30
     num_updates_per_batch: int = 4
@@ -89,7 +88,7 @@ class KaggleRunConfig:
     rolling_window: int = 20
     show_live_plots: bool = True
     prefer_gpu_if_available: bool = True
-    run_eval_at_step_zero: bool = False
+    run_eval_at_step_zero: bool = True
     output_dir: str = str(REPO_ROOT / "kaggle_outputs" / "fpo_ant_v4")
 
     def make_fpo_config(self) -> fpo.FpoConfig:
@@ -118,38 +117,6 @@ class KaggleRunConfig:
             num_evals=self.num_evals,
             episode_length=self.episode_length,
         )
-
-
-@dataclass(slots=True)
-class EpisodeTracker:
-    """Tracks in-flight and completed episode stats across rollouts."""
-
-    returns: np.ndarray
-    lengths: np.ndarray
-
-    @classmethod
-    def init(cls, num_envs: int) -> "EpisodeTracker":
-        return cls(
-            returns=np.zeros(num_envs, dtype=np.float32),
-            lengths=np.zeros(num_envs, dtype=np.int32),
-        )
-
-    def update(
-        self,
-        rewards: np.ndarray,
-        terminated: np.ndarray,
-        truncated: np.ndarray,
-    ) -> tuple[list[float], list[int]]:
-        done = np.logical_or(terminated, truncated)
-        self.returns += rewards.astype(np.float32)
-        self.lengths += 1
-
-        finished_returns = self.returns[done].astype(np.float32).tolist()
-        finished_lengths = self.lengths[done].astype(np.int32).tolist()
-
-        self.returns[done] = 0.0
-        self.lengths[done] = 0
-        return finished_returns, finished_lengths
 
 
 @dataclass(slots=True)
@@ -265,24 +232,25 @@ def build_eval_iters(
 ) -> set[int]:
     if outer_iters <= 0 or num_evals <= 0:
         return set()
+    if run_eval_at_step_zero:
+        return set(np.linspace(0, outer_iters - 1, min(num_evals, outer_iters), dtype=int))
 
-    start_iter = 0 if run_eval_at_step_zero or outer_iters == 1 else 1
+    start_iter = 1 if outer_iters > 1 else 0
     eval_count = min(num_evals, outer_iters - start_iter)
     if eval_count <= 0:
         return set()
-
     return set(np.linspace(start_iter, outer_iters - 1, eval_count, dtype=int))
 
 
 def compute_outer_iters(config: fpo.FpoConfig) -> tuple[int, int]:
     timesteps_per_outer_iter = config.iterations_per_env * config.num_envs
-    outer_iters = math.ceil(config.num_timesteps / timesteps_per_outer_iter)
+    outer_iters = config.num_timesteps // timesteps_per_outer_iter
     planned_total_timesteps = outer_iters * timesteps_per_outer_iter
     return outer_iters, planned_total_timesteps
 
 
 class GymnasiumBatchEnv:
-    """Small Python-side batch env with baseline-style auto-reset."""
+    """Small Python-side batch env."""
 
     def __init__(self, env_name: str, num_envs: int, seed: int) -> None:
         self.env_name = env_name
@@ -336,16 +304,21 @@ class GymnasiumBatchEnv:
     def step(
         self,
         action_batch: np.ndarray,
+        active_mask: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if self.current_obs is None:
             raise RuntimeError("Call reset() before step().")
+        if active_mask is None:
+            active_mask = np.ones(self.num_envs, dtype=np.bool_)
 
-        next_obs_batch = np.zeros_like(self.current_obs)
+        next_obs_batch = self.current_obs.copy()
         rewards = np.zeros(self.num_envs, dtype=np.float32)
         terminated = np.zeros(self.num_envs, dtype=np.bool_)
         truncated = np.zeros(self.num_envs, dtype=np.bool_)
 
         for env_index, env in enumerate(self.envs):
+            if not active_mask[env_index]:
+                continue
             next_obs, reward, term, trunc, _ = env.step(
                 self._format_action(action_batch[env_index])
             )
@@ -354,74 +327,134 @@ class GymnasiumBatchEnv:
             rewards[env_index] = float(reward)
             terminated[env_index] = bool(term)
             truncated[env_index] = bool(trunc)
+        self.current_obs = next_obs_batch.copy()
+        return next_obs_batch.copy(), rewards, terminated, truncated
 
-            if term or trunc:
-                reset_obs, _ = env.reset(seed=self._next_seed())
-                self.current_obs[env_index] = self._format_obs(reset_obs)
-            else:
-                self.current_obs[env_index] = next_obs_batch[env_index]
-
-        return next_obs_batch, rewards, terminated, truncated
+    def reset_where(self, reset_mask: np.ndarray) -> np.ndarray:
+        if self.current_obs is None:
+            raise RuntimeError("Call reset() before reset_where().")
+        for env_index, should_reset in enumerate(reset_mask):
+            if should_reset:
+                obs, _ = self.envs[env_index].reset(seed=self._next_seed())
+                self.current_obs[env_index] = self._format_obs(obs)
+        return self.current_obs.copy()
 
     def close(self) -> None:
         for env in self.envs:
             env.close()
 
 
-def collect_train_rollout(
-    env: GymnasiumBatchEnv,
-    agent_state: fpo.FpoState,
-    prng: jax.Array,
-    tracker: EpisodeTracker,
-    sample_action_fn: Any,
-    compute_device: jax.Device,
-) -> tuple[rollouts.TransitionStruct[Any], jax.Array, list[float], list[int]]:
-    config = agent_state.config
+@dataclass(slots=True)
+class GymnasiumBatchedRolloutState:
+    """Gymnasium analogue of the official batched rollout state."""
 
-    obs_seq = []
-    next_obs_seq = []
-    action_seq = []
-    reward_seq = []
-    truncation_seq = []
-    discount_seq = []
-    action_info_seq = []
-    completed_returns: list[float] = []
-    completed_lengths: list[int] = []
+    env: GymnasiumBatchEnv
+    env_obs: np.ndarray
+    steps: np.ndarray
+    inactive: np.ndarray
+    num_envs: int
+    prng: jax.Array
 
-    obs = env.get_obs()
-    for _ in range(config.iterations_per_env):
-        prng, step_key = jax.random.split(prng)
-        obs_jax = jax.device_put(jnp.asarray(obs, dtype=jnp.float32), compute_device)
-        step_key = jax.device_put(step_key, compute_device)
-        action, action_info = sample_action_fn(
-            agent_state,
-            obs_jax,
-            step_key,
+    @classmethod
+    def init(
+        cls,
+        env: GymnasiumBatchEnv,
+        prng: jax.Array,
+        num_envs: int,
+    ) -> "GymnasiumBatchedRolloutState":
+        obs = env.reset()
+        return cls(
+            env=env,
+            env_obs=obs,
+            steps=np.zeros(num_envs, dtype=np.int32),
+            inactive=np.zeros(num_envs, dtype=np.bool_),
+            num_envs=num_envs,
+            prng=prng,
         )
 
-        stepped_action = np.tanh(np.asarray(jax.device_get(action), dtype=np.float32))
-        next_obs, reward, terminated, truncated = env.step(stepped_action)
-        finished_returns, finished_lengths = tracker.update(
-            reward,
-            terminated,
-            truncated,
+    def rollout(
+        self,
+        agent_state: fpo.FpoState,
+        sample_action_fn: Any,
+        compute_device: jax.Device,
+        episode_length: int,
+        iterations_per_env: int,
+        auto_reset: bool = True,
+    ) -> tuple["GymnasiumBatchedRolloutState", rollouts.TransitionStruct[Any]]:
+        obs_seq = []
+        next_obs_seq = []
+        action_seq = []
+        reward_seq = []
+        truncation_seq = []
+        discount_seq = []
+        action_info_seq = []
+
+        env_obs = self.env_obs.copy()
+        steps = self.steps.copy()
+        inactive = (
+            np.zeros(self.num_envs, dtype=np.bool_)
+            if auto_reset
+            else self.inactive.copy()
         )
+        prng = self.prng
 
-        completed_returns.extend(finished_returns)
-        completed_lengths.extend(finished_lengths)
+        for _ in range(iterations_per_env):
+            prng_act, prng_next = jax.random.split(prng)
+            obs_jax = jax.device_put(jnp.asarray(env_obs, dtype=jnp.float32), compute_device)
+            prng_act = jax.device_put(prng_act, compute_device)
+            action, action_info = sample_action_fn(agent_state, obs_jax, prng_act)
 
-        obs_seq.append(obs_jax)
-        next_obs_seq.append(jnp.asarray(next_obs, dtype=jnp.float32))
-        action_seq.append(action)
-        reward_seq.append(jnp.asarray(reward, dtype=jnp.float32))
-        truncation_seq.append(jnp.asarray(truncated, dtype=jnp.float32))
-        discount_seq.append(1.0 - jnp.asarray(terminated, dtype=jnp.float32))
-        action_info_seq.append(action_info)
+            action_np = np.tanh(np.asarray(jax.device_get(action), dtype=np.float32))
+            step_mask = ~inactive
+            next_obs = env_obs.copy()
+            reward = np.zeros(self.num_envs, dtype=np.float32)
+            terminated = inactive.copy()
+            env_truncated = np.zeros(self.num_envs, dtype=np.bool_)
 
-        obs = env.get_obs()
+            if bool(step_mask.any()):
+                step_obs, step_reward, step_terminated, step_truncated = self.env.step(
+                    action_np,
+                    active_mask=step_mask,
+                )
+                next_obs[step_mask] = step_obs[step_mask]
+                reward[step_mask] = step_reward[step_mask]
+                terminated[step_mask] = step_terminated[step_mask]
+                env_truncated[step_mask] = step_truncated[step_mask]
 
-    return (
-        rollouts.TransitionStruct(
+            next_steps = steps + (~inactive).astype(np.int32)
+            truncation = np.logical_or(env_truncated, next_steps >= episode_length)
+            done_env = terminated.astype(np.bool_)
+            done_or_tr = np.logical_or(done_env, truncation)
+            discount = 1.0 - done_env.astype(np.float32)
+
+            obs_seq.append(obs_jax)
+            next_obs_seq.append(jnp.asarray(next_obs, dtype=jnp.float32))
+            action_seq.append(action)
+            reward_seq.append(jnp.asarray(reward, dtype=jnp.float32))
+            truncation_seq.append(jnp.asarray(truncation.astype(np.float32)))
+            discount_seq.append(jnp.asarray(discount, dtype=jnp.float32))
+            action_info_seq.append(action_info)
+
+            if auto_reset:
+                env_obs = self.env.reset_where(done_or_tr)
+                steps = np.where(done_or_tr, 0, next_steps)
+                inactive = np.zeros(self.num_envs, dtype=np.bool_)
+            else:
+                env_obs = next_obs
+                steps = next_steps
+                inactive = np.logical_or(inactive, done_or_tr)
+
+            prng = prng_next
+
+        next_state = GymnasiumBatchedRolloutState(
+            env=self.env,
+            env_obs=env_obs,
+            steps=steps,
+            inactive=inactive,
+            num_envs=self.num_envs,
+            prng=prng,
+        )
+        transitions = rollouts.TransitionStruct(
             obs=jnp.stack(obs_seq, axis=0),
             next_obs=jnp.stack(next_obs_seq, axis=0),
             action=jnp.stack(action_seq, axis=0),
@@ -429,83 +462,76 @@ def collect_train_rollout(
             reward=jnp.stack(reward_seq, axis=0),
             truncation=jnp.stack(truncation_seq, axis=0),
             discount=jnp.stack(discount_seq, axis=0),
-        ),
-        prng,
-        completed_returns,
-        completed_lengths,
+        )
+        return next_state, transitions
+
+
+def extract_completed_episode_stats(
+    transitions: rollouts.TransitionStruct[Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    rewards = np.asarray(jax.device_get(transitions.reward), dtype=np.float32)
+    truncation = np.asarray(jax.device_get(transitions.truncation), dtype=np.float32)
+    discount = np.asarray(jax.device_get(transitions.discount), dtype=np.float32)
+
+    episode_returns: list[float] = []
+    episode_lengths: list[int] = []
+    horizon, batch = rewards.shape
+
+    for env_index in range(batch):
+        running_return = 0.0
+        running_length = 0
+        for t in range(horizon):
+            running_return += float(rewards[t, env_index])
+            running_length += 1
+            if truncation[t, env_index] > 0.5 or discount[t, env_index] == 0.0:
+                episode_returns.append(running_return)
+                episode_lengths.append(running_length)
+                running_return = 0.0
+                running_length = 0
+
+    return (
+        np.asarray(episode_returns, dtype=np.float32),
+        np.asarray(episode_lengths, dtype=np.int32),
     )
 
 
-def evaluate_policy(
+def gymnasium_eval_policy(
     agent_state: fpo.FpoState,
     env_name: str,
+    prng: jax.Array,
     num_envs: int,
-    episode_length: int,
-    seed: int,
+    max_episode_length: int,
     sample_action_fn: Any,
     compute_device: jax.Device,
 ) -> dict[str, float]:
-    envs = [gym.make(env_name) for _ in range(num_envs)]
+    seed = int(np.asarray(jax.device_get(prng)).reshape(-1)[0])
+    eval_env = GymnasiumBatchEnv(env_name, num_envs, seed=seed)
     try:
-        obs = np.stack(
-            [
-                np.asarray(
-                    env.reset(seed=seed + env_index)[0],
-                    dtype=np.float32,
-                ).reshape(agent_state.env.observation_size)
-                for env_index, env in enumerate(envs)
-            ],
-            axis=0,
+        rollout_state = GymnasiumBatchedRolloutState.init(eval_env, prng, num_envs)
+        _, transitions = rollout_state.rollout(
+            agent_state=agent_state,
+            sample_action_fn=sample_action_fn,
+            compute_device=compute_device,
+            episode_length=max_episode_length,
+            iterations_per_env=max_episode_length,
+            auto_reset=False,
         )
-        done = np.zeros(num_envs, dtype=np.bool_)
-        rewards = np.zeros(num_envs, dtype=np.float32)
-        lengths = np.zeros(num_envs, dtype=np.int32)
-        prng = jax.random.key(seed)
-
-        for _ in range(episode_length):
-            if bool(done.all()):
-                break
-
-            prng, step_key = jax.random.split(prng)
-            obs_jax = jax.device_put(jnp.asarray(obs, dtype=jnp.float32), compute_device)
-            step_key = jax.device_put(step_key, compute_device)
-            action, _ = sample_action_fn(
-                agent_state,
-                obs_jax,
-                step_key,
-            )
-            action_batch = np.tanh(np.asarray(jax.device_get(action), dtype=np.float32))
-
-            for env_index, env in enumerate(envs):
-                if done[env_index]:
-                    continue
-
-                env_action = np.clip(
-                    action_batch[env_index].reshape(env.action_space.shape),
-                    env.action_space.low,
-                    env.action_space.high,
-                )
-                next_obs, reward, terminated, truncated, _ = env.step(env_action)
-                rewards[env_index] += float(reward)
-                lengths[env_index] += 1
-                obs[env_index] = np.asarray(next_obs, dtype=np.float32).reshape(
-                    agent_state.env.observation_size
-                )
-                done[env_index] = bool(terminated or truncated)
+        valid_mask = transitions.discount > 0.0
+        rewards = jnp.sum(transitions.reward, axis=0)
+        steps = jnp.sum(valid_mask, axis=0)
 
         return {
-            "reward_mean": float(np.mean(rewards)),
-            "reward_min": float(np.min(rewards)),
-            "reward_max": float(np.max(rewards)),
-            "reward_std": float(np.std(rewards)),
-            "steps_mean": float(np.mean(lengths)),
-            "steps_min": float(np.min(lengths)),
-            "steps_max": float(np.max(lengths)),
-            "steps_std": float(np.std(lengths)),
+            "reward_mean": float(np.asarray(jnp.mean(rewards))),
+            "reward_min": float(np.asarray(jnp.min(rewards))),
+            "reward_max": float(np.asarray(jnp.max(rewards))),
+            "reward_std": float(np.asarray(jnp.std(rewards))),
+            "steps_mean": float(np.asarray(jnp.mean(steps))),
+            "steps_min": float(np.asarray(jnp.min(steps))),
+            "steps_max": float(np.asarray(jnp.max(steps))),
+            "steps_std": float(np.asarray(jnp.std(steps))),
         }
     finally:
-        for env in envs:
-            env.close()
+        eval_env.close()
 
 
 def moving_average(values: np.ndarray, window: int) -> np.ndarray:
@@ -810,9 +836,11 @@ def train_gymnasium_baseline(
             f"env={run_config.env_name}"
         ),
     )
-    train_env.reset()
-
-    tracker = EpisodeTracker.init(run_config.num_envs)
+    rollout_state = GymnasiumBatchedRolloutState.init(
+        train_env,
+        jax.device_put(jax.random.key(run_config.seed + 1), compute_device),
+        run_config.num_envs,
+    )
     render_phase_progress(
         run_config=run_config,
         live_display=live_display,
@@ -829,7 +857,6 @@ def train_gymnasium_baseline(
         config=config,
     )
     agent_state = jax.device_put(agent_state, compute_device)
-    prng = jax.device_put(jax.random.key(run_config.seed + 1), compute_device)
 
     outer_iters, planned_total_timesteps = compute_outer_iters(config)
     if outer_iters <= 0:
@@ -887,12 +914,15 @@ def train_gymnasium_baseline(
                     live_display.update_status(phase_status)
                 eval_row = {
                     "step": outer_iter,
-                    **evaluate_policy(
+                    **gymnasium_eval_policy(
                         agent_state=agent_state,
                         env_name=run_config.env_name,
+                        prng=jax.device_put(
+                            jax.random.key(run_config.seed + 10_000 + outer_iter),
+                            compute_device,
+                        ),
                         num_envs=run_config.eval_num_envs,
-                        episode_length=config.episode_length,
-                        seed=run_config.seed + 10_000 + outer_iter,
+                        max_episode_length=config.episode_length,
                         sample_action_fn=eval_sample_action_fn,
                         compute_device=compute_device,
                     ),
@@ -916,13 +946,13 @@ def train_gymnasium_baseline(
                 )
             else:
                 live_display.update_status(phase_status)
-            transitions, prng, batch_episode_returns, batch_episode_lengths = collect_train_rollout(
-                env=train_env,
+            rollout_state, transitions = rollout_state.rollout(
                 agent_state=agent_state,
-                prng=prng,
-                tracker=tracker,
                 sample_action_fn=train_sample_action_fn,
                 compute_device=compute_device,
+                episode_length=config.episode_length,
+                iterations_per_env=config.iterations_per_env,
+                auto_reset=True,
             )
             phase_status = (
                 f"iter {outer_iter + 1}/{outer_iters}\n"
@@ -942,6 +972,9 @@ def train_gymnasium_baseline(
                 live_display.update_status(phase_status)
             agent_state, metrics = agent_state.training_step(transitions)
 
+            batch_episode_returns, batch_episode_lengths = extract_completed_episode_stats(
+                transitions
+            )
             reward_np = np.asarray(jax.device_get(transitions.reward), dtype=np.float32)
             metric_means = {
                 key: float(np.asarray(jax.device_get(value)).mean())
