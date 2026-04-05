@@ -108,7 +108,12 @@ class KaggleRunConfig:
     final_video_fps: int = 30
     final_video_max_steps: int = 5000
     require_exact_num_timesteps: bool = False
-    output_dir: str = str(REPO_ROOT / "kaggle_outputs" / "fpo_ant_v4")
+    output_dir: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.output_dir is None:
+            env_slug = self.env_name.lower().replace("-", "_")
+            self.output_dir = str(REPO_ROOT / "kaggle_outputs" / f"fpo_{env_slug}")
 
     def make_fpo_config(self) -> fpo.FpoConfig:
         if self.env_name not in SUPPORTED_GYMNASIUM_TASKS:
@@ -1480,10 +1485,7 @@ def train_gymnasium_baseline(
 
 
 def main() -> None:
-    run_config = KaggleRunConfig(
-        env_name="Ant-v4",
-        output_dir=str(REPO_ROOT / "kaggle_outputs" / "fpo_ant_v4"),
-    )
+    run_config = KaggleRunConfig()
     train_gymnasium_baseline(run_config)
 
 
