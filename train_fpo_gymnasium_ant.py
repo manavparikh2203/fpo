@@ -172,18 +172,22 @@ def train_ant_gymnasium(
             f"episodes={row['num_episodes']}"
         )
 
-    train_csv = output_dir / "train_metrics.csv"
-    pd.DataFrame(history).to_csv(train_csv, index=False)
+        # Save intermediate results every 10 iterations
+        if (i + 1) % 10 == 0 or i == outer_iters - 1:
+            pd.DataFrame(history).to_csv(train_csv, index=False)
+            fig, ax = plt.subplots(figsize=(10, 5))
+            ax.plot([row["step"] for row in history], [row["mean_reward"] for row in history], label="mean_reward")
+            ax.plot([row["step"] for row in history], [row["mean_episode_reward"] for row in history], label="mean_episode_reward")
+            ax.set_title(f"{env_name} FPO Training (Iter {i+1})")
+            ax.set_xlabel("outer iteration")
+            ax.set_ylabel("reward")
+            ax.legend()
+            fig.savefig(output_dir / "reward_curve.png")
+            plt.close(fig)
+            print(f"Saved intermediate results at iteration {i+1}")
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot([row["step"] for row in history], [row["mean_reward"] for row in history], label="mean_reward")
-    ax.plot([row["step"] for row in history], [row["mean_episode_reward"] for row in history], label="mean_episode_reward")
-    ax.set_title(f"{env_name} FPO Training")
-    ax.set_xlabel("outer iteration")
-    ax.set_ylabel("reward")
-    ax.legend()
-    fig.savefig(output_dir / "reward_curve.png")
-    plt.close(fig)
+    # Final save is handled in the loop
+    print(f"Training complete. Results saved to {output_dir}")
 
 
 def main():
