@@ -89,10 +89,10 @@ class KaggleRunConfig:
     seed: int = 0
     num_timesteps: int = 1000000
     num_envs: int = 32
-    batch_size: int = 40
-    num_minibatches: int = 8
+    batch_size: int = 1024
+    num_minibatches: int = 1
     unroll_length: int = 25
-    num_updates_per_batch: int = 61
+    num_updates_per_batch: int = 16
     num_evals: int = 64
     eval_num_envs: int = 4
     episode_length: int = 1000
@@ -106,7 +106,7 @@ class KaggleRunConfig:
     save_final_video: bool = True
     final_video_fps: int = 30
     final_video_max_steps: int = 5000
-    require_exact_num_timesteps: bool = True
+    require_exact_num_timesteps: bool = False
     output_dir: str = str(REPO_ROOT / "kaggle_outputs" / "fpo_ant_v4")
 
     def make_fpo_config(self) -> fpo.FpoConfig:
