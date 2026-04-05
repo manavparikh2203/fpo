@@ -81,12 +81,14 @@ class KaggleRunConfig:
     unroll_length: int = 30
     num_updates_per_batch: int = 4
     num_evals: int = 8
-    eval_num_envs: int = 8
+    eval_num_envs: int = 4
     episode_length: int = 1000
     plot_every: int = 1
     save_every: int = 1
     rolling_window: int = 20
     show_live_plots: bool = True
+    prefer_gpu_if_available: bool = True
+    run_eval_at_step_zero: bool = False
     output_dir: str = str(REPO_ROOT / "kaggle_outputs" / "fpo_ant_v4")
 
     def make_fpo_config(self) -> fpo.FpoConfig:
@@ -224,6 +226,53 @@ def _is_notebook_runtime() -> bool:
     return shell.__class__.__name__ == "ZMQInteractiveShell"
 
 
+def select_compute_device(prefer_gpu_if_available: bool) -> tuple[jax.Device, str]:
+    if prefer_gpu_if_available:
+        try:
+            gpu_devices = jax.devices("gpu")
+        except RuntimeError:
+            gpu_devices = []
+        if gpu_devices:
+            return gpu_devices[0], "gpu"
+
+    cpu_devices = jax.devices("cpu")
+    return cpu_devices[0], "cpu"
+
+
+def make_sample_action_fns() -> tuple[Any, Any]:
+    train_sample_fn = jax.jit(
+        lambda agent_state, obs, prng: agent_state.sample_action(
+            obs,
+            prng,
+            deterministic=False,
+        )
+    )
+    eval_sample_fn = jax.jit(
+        lambda agent_state, obs, prng: agent_state.sample_action(
+            obs,
+            prng,
+            deterministic=True,
+        )
+    )
+    return train_sample_fn, eval_sample_fn
+
+
+def build_eval_iters(
+    outer_iters: int,
+    num_evals: int,
+    run_eval_at_step_zero: bool,
+) -> set[int]:
+    if outer_iters <= 0 or num_evals <= 0:
+        return set()
+
+    start_iter = 0 if run_eval_at_step_zero or outer_iters == 1 else 1
+    eval_count = min(num_evals, outer_iters - start_iter)
+    if eval_count <= 0:
+        return set()
+
+    return set(np.linspace(start_iter, outer_iters - 1, eval_count, dtype=int))
+
+
 class GymnasiumBatchEnv:
     """Small Python-side batch env with baseline-style auto-reset."""
 
@@ -316,6 +365,8 @@ def collect_train_rollout(
     agent_state: fpo.FpoState,
     prng: jax.Array,
     tracker: EpisodeTracker,
+    sample_action_fn: Any,
+    compute_device: jax.Device,
 ) -> tuple[rollouts.TransitionStruct[Any], jax.Array, list[float], list[int]]:
     config = agent_state.config
 
@@ -332,11 +383,12 @@ def collect_train_rollout(
     obs = env.get_obs()
     for _ in range(config.iterations_per_env):
         prng, step_key = jax.random.split(prng)
-        obs_jax = jnp.asarray(obs, dtype=jnp.float32)
-        action, action_info = agent_state.sample_action(
+        obs_jax = jax.device_put(jnp.asarray(obs, dtype=jnp.float32), compute_device)
+        step_key = jax.device_put(step_key, compute_device)
+        action, action_info = sample_action_fn(
+            agent_state,
             obs_jax,
             step_key,
-            deterministic=False,
         )
 
         stepped_action = np.tanh(np.asarray(jax.device_get(action), dtype=np.float32))
@@ -382,6 +434,8 @@ def evaluate_policy(
     num_envs: int,
     episode_length: int,
     seed: int,
+    sample_action_fn: Any,
+    compute_device: jax.Device,
 ) -> dict[str, float]:
     envs = [gym.make(env_name) for _ in range(num_envs)]
     try:
@@ -405,10 +459,12 @@ def evaluate_policy(
                 break
 
             prng, step_key = jax.random.split(prng)
-            action, _ = agent_state.sample_action(
-                jnp.asarray(obs, dtype=jnp.float32),
+            obs_jax = jax.device_put(jnp.asarray(obs, dtype=jnp.float32), compute_device)
+            step_key = jax.device_put(step_key, compute_device)
+            action, _ = sample_action_fn(
+                agent_state,
+                obs_jax,
                 step_key,
-                deterministic=True,
             )
             action_batch = np.tanh(np.asarray(jax.device_get(action), dtype=np.float32))
 
@@ -703,6 +759,10 @@ def train_gymnasium_baseline(
     output_dir = Path(run_config.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     live_display = LiveDisplayManager.create(enabled=run_config.show_live_plots)
+    compute_device, compute_backend = select_compute_device(
+        run_config.prefer_gpu_if_available
+    )
+    train_sample_action_fn, eval_sample_action_fn = make_sample_action_fns()
     render_phase_progress(
         run_config=run_config,
         live_display=live_display,
@@ -711,7 +771,9 @@ def train_gymnasium_baseline(
         status_text=(
             f"starting run for {run_config.env_name}\n"
             f"num_envs={run_config.num_envs}\n"
-            f"num_timesteps={run_config.num_timesteps}"
+            f"num_timesteps={run_config.num_timesteps}\n"
+            f"jax_backend={compute_backend}\n"
+            f"jax_device={compute_device}"
         ),
     )
 
@@ -758,7 +820,8 @@ def train_gymnasium_baseline(
         env=train_env,
         config=config,
     )
-    prng = jax.random.key(run_config.seed + 1)
+    agent_state = jax.device_put(agent_state, compute_device)
+    prng = jax.device_put(jax.random.key(run_config.seed + 1), compute_device)
 
     outer_iters = config.num_timesteps // (config.iterations_per_env * config.num_envs)
     if outer_iters <= 0:
@@ -767,7 +830,11 @@ def train_gymnasium_baseline(
             f"Need at least {config.iterations_per_env * config.num_envs}, "
             f"got {config.num_timesteps}."
         )
-    eval_iters = set(np.linspace(0, outer_iters - 1, config.num_evals, dtype=int))
+    eval_iters = build_eval_iters(
+        outer_iters=outer_iters,
+        num_evals=config.num_evals,
+        run_eval_at_step_zero=run_config.run_eval_at_step_zero,
+    )
     render_phase_progress(
         run_config=run_config,
         live_display=live_display,
@@ -777,6 +844,8 @@ def train_gymnasium_baseline(
             f"initialized env and agent\n"
             f"outer_iters={outer_iters}\n"
             f"iterations_per_env={config.iterations_per_env}\n"
+            f"eval_num_envs={run_config.eval_num_envs}\n"
+            f"jax_backend={compute_backend}\n"
             "collecting first rollout next"
         ),
     )
@@ -814,6 +883,8 @@ def train_gymnasium_baseline(
                         num_envs=run_config.eval_num_envs,
                         episode_length=config.episode_length,
                         seed=run_config.seed + 10_000 + outer_iter,
+                        sample_action_fn=eval_sample_action_fn,
+                        compute_device=compute_device,
                     ),
                 }
                 eval_history.append(eval_row)
@@ -840,6 +911,8 @@ def train_gymnasium_baseline(
                 agent_state=agent_state,
                 prng=prng,
                 tracker=tracker,
+                sample_action_fn=train_sample_action_fn,
+                compute_device=compute_device,
             )
             phase_status = (
                 f"iter {outer_iter + 1}/{outer_iters}\n"
