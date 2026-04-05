@@ -21,6 +21,7 @@ The live plots refresh in that same output cell during training.
 from __future__ import annotations
 
 import base64
+import math
 import csv
 import dataclasses
 import io
@@ -271,6 +272,13 @@ def build_eval_iters(
         return set()
 
     return set(np.linspace(start_iter, outer_iters - 1, eval_count, dtype=int))
+
+
+def compute_outer_iters(config: fpo.FpoConfig) -> tuple[int, int]:
+    timesteps_per_outer_iter = config.iterations_per_env * config.num_envs
+    outer_iters = math.ceil(config.num_timesteps / timesteps_per_outer_iter)
+    planned_total_timesteps = outer_iters * timesteps_per_outer_iter
+    return outer_iters, planned_total_timesteps
 
 
 class GymnasiumBatchEnv:
@@ -823,7 +831,7 @@ def train_gymnasium_baseline(
     agent_state = jax.device_put(agent_state, compute_device)
     prng = jax.device_put(jax.random.key(run_config.seed + 1), compute_device)
 
-    outer_iters = config.num_timesteps // (config.iterations_per_env * config.num_envs)
+    outer_iters, planned_total_timesteps = compute_outer_iters(config)
     if outer_iters <= 0:
         raise ValueError(
             "num_timesteps is too small for one outer iteration. "
@@ -844,6 +852,8 @@ def train_gymnasium_baseline(
             f"initialized env and agent\n"
             f"outer_iters={outer_iters}\n"
             f"iterations_per_env={config.iterations_per_env}\n"
+            f"requested_num_timesteps={config.num_timesteps}\n"
+            f"planned_total_timesteps={planned_total_timesteps}\n"
             f"eval_num_envs={run_config.eval_num_envs}\n"
             f"jax_backend={compute_backend}\n"
             "collecting first rollout next"
