@@ -20,8 +20,10 @@ The live plots refresh in that same output cell during training.
 
 from __future__ import annotations
 
+import base64
 import csv
 import dataclasses
+import io
 import json
 import os
 import sys
@@ -160,18 +162,52 @@ class LiveDisplayManager:
         notebook_enabled = enabled and _is_notebook_runtime()
         return cls(enabled=notebook_enabled)
 
-    def update(self, fig: plt.Figure, status_text: str) -> None:
+    def _make_status_html(self, status_text: str) -> Any:
+        assert HTML is not None
+        escaped = (
+            status_text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        return HTML(
+            "<pre style='white-space: pre-wrap; font-family: monospace; "
+            "padding: 10px; border: 1px solid #ddd; border-radius: 8px; "
+            "background: #fafafa;'>"
+            f"{escaped}"
+            "</pre>"
+        )
+
+    def _make_figure_html(self, fig: plt.Figure) -> Any:
+        assert HTML is not None
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png", dpi=150, bbox_inches="tight")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return HTML(
+            "<img "
+            f"src='data:image/png;base64,{encoded}' "
+            "style='max-width: 100%; height: auto; display: block;'/>"
+        )
+
+    def update_status(self, status_text: str) -> None:
         if self.enabled and display is not None and HTML is not None:
-            status_html = HTML(
-                "<pre style='white-space: pre-wrap; font-family: monospace;'>"
-                f"{status_text}"
-                "</pre>"
-            )
-            if self.figure_handle is None:
-                self.figure_handle = display(fig, display_id=True)
+            status_html = self._make_status_html(status_text)
+            if self.status_handle is None:
                 self.status_handle = display(status_html, display_id=True)
             else:
-                self.figure_handle.update(fig)
+                self.status_handle.update(status_html)
+            return
+
+        print(status_text, flush=True)
+
+    def update(self, fig: plt.Figure, status_text: str) -> None:
+        if self.enabled and display is not None and HTML is not None:
+            figure_html = self._make_figure_html(fig)
+            status_html = self._make_status_html(status_text)
+            if self.figure_handle is None:
+                self.figure_handle = display(figure_html, display_id=True)
+                self.status_handle = display(status_html, display_id=True)
+            else:
+                self.figure_handle.update(figure_html)
                 assert self.status_handle is not None
                 self.status_handle.update(status_html)
             return
@@ -434,6 +470,46 @@ def write_csv_rows(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def render_placeholder_dashboard(
+    run_config: KaggleRunConfig,
+    live_display: LiveDisplayManager,
+    output_dir: Path,
+    title_suffix: str,
+    status_text: str,
+) -> None:
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    panel_titles = (
+        "Reward And Return",
+        "Live Episode Returns",
+        "Episode Length",
+        "Optimization",
+    )
+
+    for ax, panel_title in zip(axes.flat, panel_titles, strict=False):
+        ax.set_title(panel_title)
+        ax.grid(alpha=0.2)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.text(
+            0.5,
+            0.5,
+            title_suffix,
+            ha="center",
+            va="center",
+            fontsize=12,
+            transform=ax.transAxes,
+        )
+
+    fig.suptitle(
+        f"FPO baseline on {run_config.env_name} | {title_suffix}",
+        fontsize=14,
+    )
+    fig.tight_layout()
+    fig.savefig(output_dir / "live_training_dashboard.png", dpi=150, bbox_inches="tight")
+    live_display.update(fig, f"{status_text}\noutput_dir={output_dir}")
+    plt.close(fig)
+
+
 def render_live_dashboard(
     run_config: KaggleRunConfig,
     train_history: list[dict[str, Any]],
@@ -611,6 +687,17 @@ def train_gymnasium_baseline(
     output_dir = Path(run_config.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     live_display = LiveDisplayManager.create(enabled=run_config.show_live_plots)
+    render_placeholder_dashboard(
+        run_config=run_config,
+        live_display=live_display,
+        output_dir=output_dir,
+        title_suffix="Initializing",
+        status_text=(
+            f"starting run for {run_config.env_name}\n"
+            f"num_envs={run_config.num_envs}\n"
+            f"num_timesteps={run_config.num_timesteps}"
+        ),
+    )
 
     train_env = GymnasiumBatchEnv(
         env_name=run_config.env_name,
@@ -635,6 +722,12 @@ def train_gymnasium_baseline(
             f"got {config.num_timesteps}."
         )
     eval_iters = set(np.linspace(0, outer_iters - 1, config.num_evals, dtype=int))
+    live_display.update_status(
+        f"initialized env and agent\n"
+        f"outer_iters={outer_iters}\n"
+        f"iterations_per_env={config.iterations_per_env}\n"
+        f"first dashboard update will appear after iteration 1"
+    )
 
     train_history: list[dict[str, Any]] = []
     eval_history: list[dict[str, Any]] = []
@@ -644,6 +737,11 @@ def train_gymnasium_baseline(
     try:
         for outer_iter in range(outer_iters):
             if outer_iter in eval_iters:
+                live_display.update_status(
+                    f"iter {outer_iter + 1}/{outer_iters}\n"
+                    f"phase=evaluation\n"
+                    f"env={run_config.env_name}"
+                )
                 eval_row = {
                     "step": outer_iter,
                     **evaluate_policy(
@@ -656,11 +754,22 @@ def train_gymnasium_baseline(
                 }
                 eval_history.append(eval_row)
 
+            live_display.update_status(
+                f"iter {outer_iter + 1}/{outer_iters}\n"
+                f"phase=collect_rollout\n"
+                f"iterations_per_env={config.iterations_per_env}\n"
+                f"completed_episodes_total={len(episode_history)}"
+            )
             transitions, prng, batch_episode_returns, batch_episode_lengths = collect_train_rollout(
                 env=train_env,
                 agent_state=agent_state,
                 prng=prng,
                 tracker=tracker,
+            )
+            live_display.update_status(
+                f"iter {outer_iter + 1}/{outer_iters}\n"
+                f"phase=training_step\n"
+                f"completed_episodes_total={len(episode_history)}"
             )
             agent_state, metrics = agent_state.training_step(transitions)
 
