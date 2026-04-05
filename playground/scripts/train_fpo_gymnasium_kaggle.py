@@ -73,14 +73,14 @@ SUPPORTED_GYMNASIUM_TASKS = (
 class KaggleRunConfig:
     """Run config for a notebook-friendly Gymnasium FPO baseline."""
 
-    env_name: str = "Ant-v4"
+    env_name: str = "HalfCheetah-v4"
     seed: int = 0
-    num_timesteps: int = 10000000
-    num_envs: int = 128
-    batch_size: int = 32
+    num_timesteps: int = 1000000
+    num_envs: int = 32
+    batch_size: int = 40
     num_minibatches: int = 8
-    unroll_length: int = 30
-    num_updates_per_batch: int = 32
+    unroll_length: int = 25
+    num_updates_per_batch: int = 61
     num_evals: int = 64
     eval_num_envs: int = 4
     episode_length: int = 1000
@@ -93,7 +93,8 @@ class KaggleRunConfig:
     save_final_plots: bool = True
     save_final_video: bool = True
     final_video_fps: int = 30
-    final_video_max_steps: int = 1000
+    final_video_max_steps: int = 5000
+    require_exact_num_timesteps: bool = True
     output_dir: str = str(REPO_ROOT / "kaggle_outputs" / "fpo_ant_v4")
 
     def make_fpo_config(self) -> fpo.FpoConfig:
@@ -295,6 +296,12 @@ def compute_outer_iters(config: fpo.FpoConfig) -> tuple[int, int]:
     outer_iters = config.num_timesteps // timesteps_per_outer_iter
     planned_total_timesteps = outer_iters * timesteps_per_outer_iter
     return outer_iters, planned_total_timesteps
+
+
+def timesteps_per_outer_iter_from_run_config(run_config: KaggleRunConfig) -> int:
+    return (
+        run_config.num_minibatches * run_config.batch_size * run_config.unroll_length
+    )
 
 
 class GymnasiumBatchEnv:
@@ -647,8 +654,16 @@ def render_live_dashboard(
     elapsed_seconds: float,
 ) -> None:
     fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    timesteps_per_outer_iter = timesteps_per_outer_iter_from_run_config(run_config)
 
     train_steps = np.asarray([row["step"] for row in train_history], dtype=np.int32)
+    train_env_steps = np.asarray(
+        [
+            row.get("env_steps", (row["step"] + 1) * timesteps_per_outer_iter)
+            for row in train_history
+        ],
+        dtype=np.int64,
+    )
     train_mean_reward = np.asarray(
         [row["mean_step_reward"] for row in train_history],
         dtype=np.float32,
@@ -663,6 +678,13 @@ def render_live_dashboard(
     )
 
     eval_steps = np.asarray([row["step"] for row in eval_history], dtype=np.int32)
+    eval_env_steps = np.asarray(
+        [
+            row.get("env_steps", row["step"] * timesteps_per_outer_iter)
+            for row in eval_history
+        ],
+        dtype=np.int64,
+    )
     eval_rewards = np.asarray(
         [row["reward_mean"] for row in eval_history],
         dtype=np.float32,
@@ -672,28 +694,32 @@ def render_live_dashboard(
         dtype=np.float32,
     )
 
-    axes[0, 0].plot(train_steps, train_mean_reward, label="train mean step reward")
     axes[0, 0].plot(
-        train_steps,
+        train_env_steps,
+        train_mean_reward,
+        label="train mean step reward",
+    )
+    axes[0, 0].plot(
+        train_env_steps,
         train_mean_episode_return,
         label="train mean completed episode return",
     )
     if eval_history:
         axes[0, 0].plot(
-            eval_steps,
+            eval_env_steps,
             eval_rewards,
             marker="o",
             label="eval mean episode return",
         )
     axes[0, 0].set_title("Reward And Return")
-    axes[0, 0].set_xlabel("outer iteration")
+    axes[0, 0].set_xlabel("env steps")
     axes[0, 0].set_ylabel("reward")
     axes[0, 0].legend()
     axes[0, 0].grid(alpha=0.2)
 
-    episode_indices = np.asarray(
-        [row["episode_index"] for row in episode_history],
-        dtype=np.int32,
+    episode_env_steps = np.asarray(
+        [row.get("env_steps", row["episode_index"]) for row in episode_history],
+        dtype=np.int64,
     )
     episode_returns = np.asarray(
         [row["episode_return"] for row in episode_history],
@@ -701,13 +727,13 @@ def render_live_dashboard(
     )
     if episode_history:
         axes[0, 1].plot(
-            episode_indices,
+            episode_env_steps,
             episode_returns,
             alpha=0.35,
             label="per-episode return",
         )
         smoothed = moving_average(episode_returns, run_config.rolling_window)
-        smooth_x = episode_indices[-smoothed.size :]
+        smooth_x = episode_env_steps[-smoothed.size :]
         axes[0, 1].plot(
             smooth_x,
             smoothed,
@@ -716,27 +742,27 @@ def render_live_dashboard(
         )
     else:
         axes[0, 1].text(0.5, 0.5, "No completed episodes yet", ha="center", va="center")
-    axes[0, 1].set_title("Live Episode Returns")
-    axes[0, 1].set_xlabel("episode index")
+    axes[0, 1].set_title("Live Episode Returns Vs Env Steps")
+    axes[0, 1].set_xlabel("env steps")
     axes[0, 1].set_ylabel("return")
     if episode_history:
         axes[0, 1].legend()
     axes[0, 1].grid(alpha=0.2)
 
     axes[1, 0].plot(
-        train_steps,
+        train_env_steps,
         train_mean_episode_length,
         label="train mean completed episode length",
     )
     if eval_history:
         axes[1, 0].plot(
-            eval_steps,
+            eval_env_steps,
             eval_lengths,
             marker="o",
             label="eval mean episode length",
         )
     axes[1, 0].set_title("Episode Length")
-    axes[1, 0].set_xlabel("outer iteration")
+    axes[1, 0].set_xlabel("env steps")
     axes[1, 0].set_ylabel("steps")
     axes[1, 0].legend()
     axes[1, 0].grid(alpha=0.2)
@@ -749,10 +775,10 @@ def render_live_dashboard(
         [row["v_loss"] for row in train_history],
         dtype=np.float32,
     )
-    axes[1, 1].plot(train_steps, policy_loss, label="policy_loss")
-    axes[1, 1].plot(train_steps, value_loss, label="v_loss")
+    axes[1, 1].plot(train_env_steps, policy_loss, label="policy_loss")
+    axes[1, 1].plot(train_env_steps, value_loss, label="v_loss")
     axes[1, 1].set_title("Optimization")
-    axes[1, 1].set_xlabel("outer iteration")
+    axes[1, 1].set_xlabel("env steps")
     axes[1, 1].set_ylabel("loss")
     axes[1, 1].legend()
     axes[1, 1].grid(alpha=0.2)
@@ -794,8 +820,13 @@ def render_final_plots(
         return {}
 
     timesteps_per_outer_iter = config.iterations_per_env * config.num_envs
-    train_outer_steps = np.asarray([row["step"] for row in train_history], dtype=np.int64)
-    train_env_steps = (train_outer_steps + 1) * timesteps_per_outer_iter
+    train_env_steps = np.asarray(
+        [
+            row.get("env_steps", (row["step"] + 1) * timesteps_per_outer_iter)
+            for row in train_history
+        ],
+        dtype=np.int64,
+    )
     train_mean_reward = np.asarray(
         [row["mean_step_reward"] for row in train_history],
         dtype=np.float32,
@@ -809,8 +840,13 @@ def render_final_plots(
         dtype=np.float32,
     )
 
-    eval_outer_steps = np.asarray([row["step"] for row in eval_history], dtype=np.int64)
-    eval_env_steps = eval_outer_steps * timesteps_per_outer_iter
+    eval_env_steps = np.asarray(
+        [
+            row.get("env_steps", row["step"] * timesteps_per_outer_iter)
+            for row in eval_history
+        ],
+        dtype=np.int64,
+    )
     eval_rewards = np.asarray(
         [row["reward_mean"] for row in eval_history],
         dtype=np.float32,
@@ -820,9 +856,9 @@ def render_final_plots(
         dtype=np.float32,
     )
 
-    episode_indices = np.asarray(
-        [row["episode_index"] for row in episode_history],
-        dtype=np.int32,
+    episode_env_steps = np.asarray(
+        [row.get("env_steps", row["episode_index"]) for row in episode_history],
+        dtype=np.int64,
     )
     episode_returns = np.asarray(
         [row["episode_return"] for row in episode_history],
@@ -854,13 +890,13 @@ def render_final_plots(
 
     if episode_history:
         axes[0, 1].plot(
-            episode_indices,
+            episode_env_steps,
             episode_returns,
             alpha=0.35,
             label="per-episode return",
         )
         smoothed = moving_average(episode_returns, run_config.rolling_window)
-        smooth_x = episode_indices[-smoothed.size :]
+        smooth_x = episode_env_steps[-smoothed.size :]
         axes[0, 1].plot(
             smooth_x,
             smoothed,
@@ -870,8 +906,8 @@ def render_final_plots(
         axes[0, 1].legend()
     else:
         axes[0, 1].text(0.5, 0.5, "No completed episodes yet", ha="center", va="center")
-    axes[0, 1].set_title("Episode Return")
-    axes[0, 1].set_xlabel("episode index")
+    axes[0, 1].set_title("Episode Return Vs Env Steps")
+    axes[0, 1].set_xlabel("env steps")
     axes[0, 1].set_ylabel("return")
     axes[0, 1].grid(alpha=0.2)
 
@@ -976,14 +1012,18 @@ def save_final_eval_video(
 
     video_env = gym.make(run_config.env_name, render_mode="rgb_array")
     try:
-        obs, _ = video_env.reset(seed=run_config.seed + 20_000)
+        reset_count = 0
+        obs, _ = video_env.reset(seed=run_config.seed + 20_000 + reset_count)
         prng = jax.device_put(jax.random.key(run_config.seed + 20_000), compute_device)
         frames: list[np.ndarray] = []
-        episode_return = 0.0
-        episode_steps = 0
-        done = False
+        total_return = 0.0
+        total_steps = 0
+        current_episode_return = 0.0
+        current_episode_steps = 0
+        completed_episode_returns: list[float] = []
+        completed_episode_lengths: list[int] = []
 
-        while not done and episode_steps < run_config.final_video_max_steps:
+        while total_steps < run_config.final_video_max_steps:
             frame = video_env.render()
             if frame is not None:
                 frames.append(np.asarray(frame))
@@ -1000,9 +1040,19 @@ def save_final_eval_video(
                 video_env.action_space.high,
             )
             obs, reward, terminated, truncated, _ = video_env.step(env_action)
-            episode_return += float(reward)
-            episode_steps += 1
-            done = bool(terminated or truncated)
+            total_return += float(reward)
+            total_steps += 1
+            current_episode_return += float(reward)
+            current_episode_steps += 1
+
+            if bool(terminated or truncated):
+                completed_episode_returns.append(float(current_episode_return))
+                completed_episode_lengths.append(int(current_episode_steps))
+                current_episode_return = 0.0
+                current_episode_steps = 0
+                reset_count += 1
+                if total_steps < run_config.final_video_max_steps:
+                    obs, _ = video_env.reset(seed=run_config.seed + 20_000 + reset_count)
 
         final_frame = video_env.render()
         if final_frame is not None:
@@ -1023,8 +1073,11 @@ def save_final_eval_video(
             "status": "saved",
             "path": str(video_path),
             "format": "mp4",
-            "episode_return": float(episode_return),
-            "episode_length": int(episode_steps),
+            "total_return": float(total_return),
+            "total_steps": int(total_steps),
+            "completed_episode_returns": completed_episode_returns,
+            "completed_episode_lengths": completed_episode_lengths,
+            "completed_episodes": len(completed_episode_returns),
             "num_frames": len(frames),
         }
     except Exception as mp4_error:
@@ -1040,8 +1093,11 @@ def save_final_eval_video(
                 "status": "saved",
                 "path": str(gif_path),
                 "format": "gif",
-                "episode_return": float(episode_return),
-                "episode_length": int(episode_steps),
+                "total_return": float(total_return),
+                "total_steps": int(total_steps),
+                "completed_episode_returns": completed_episode_returns,
+                "completed_episode_lengths": completed_episode_lengths,
+                "completed_episodes": len(completed_episode_returns),
                 "num_frames": len(frames),
                 "mp4_error": str(mp4_error),
             }
@@ -1049,8 +1105,11 @@ def save_final_eval_video(
             return {
                 "status": "failed",
                 "error": f"mp4_error={mp4_error}; gif_error={gif_error}",
-                "episode_return": float(episode_return),
-                "episode_length": int(episode_steps),
+                "total_return": float(total_return),
+                "total_steps": int(total_steps),
+                "completed_episode_returns": completed_episode_returns,
+                "completed_episode_lengths": completed_episode_lengths,
+                "completed_episodes": len(completed_episode_returns),
                 "num_frames": len(frames),
             }
 
@@ -1176,6 +1235,16 @@ def train_gymnasium_baseline(
             f"Need at least {config.iterations_per_env * config.num_envs}, "
             f"got {config.num_timesteps}."
         )
+    if (
+        run_config.require_exact_num_timesteps
+        and planned_total_timesteps != config.num_timesteps
+    ):
+        raise ValueError(
+            "This run is configured to require exact total env steps, but "
+            f"{config.num_timesteps=} does not match "
+            f"{planned_total_timesteps=} with the current "
+            "num_envs/batch_size/num_minibatches/unroll_length."
+        )
     eval_iters = build_eval_iters(
         outer_iters=outer_iters,
         num_evals=config.num_evals,
@@ -1203,6 +1272,7 @@ def train_gymnasium_baseline(
     eval_history: list[dict[str, Any]] = []
     episode_history: list[dict[str, Any]] = []
     train_episode_tracker = TrainEpisodeTracker.init(run_config.num_envs)
+    timesteps_per_outer_iter = config.iterations_per_env * config.num_envs
 
     start_time = time.time()
     try:
@@ -1227,6 +1297,7 @@ def train_gymnasium_baseline(
                     live_display.update_status(phase_status)
                 eval_row = {
                     "step": outer_iter,
+                    "env_steps": outer_iter * timesteps_per_outer_iter,
                     **gymnasium_eval_policy(
                         agent_state=agent_state,
                         env_name=run_config.env_name,
@@ -1303,6 +1374,7 @@ def train_gymnasium_baseline(
                     {
                         "episode_index": len(episode_history),
                         "outer_iter": outer_iter,
+                        "env_steps": (outer_iter + 1) * timesteps_per_outer_iter,
                         "episode_return": float(episode_return),
                         "episode_length": int(episode_length),
                     }
@@ -1311,6 +1383,7 @@ def train_gymnasium_baseline(
             train_history.append(
                 {
                     "step": outer_iter,
+                    "env_steps": (outer_iter + 1) * timesteps_per_outer_iter,
                     "elapsed_seconds": float(time.time() - start_time),
                     "mean_step_reward": float(np.mean(reward_np)),
                     "mean_completed_episode_return": (
