@@ -87,7 +87,7 @@ class KaggleRunConfig:
 
     env_name: str = "HalfCheetah-v4"
     seed: int = 0
-    num_timesteps: int = 1000000
+    num_timesteps: int = 10000000
     num_envs: int = 32
     batch_size: int = 1024
     num_minibatches: int = 1
