@@ -113,7 +113,7 @@ class KaggleRunConfig:
                 f"by num_envs. Got {total_subsequence_steps=} and {self.num_envs=}."
             )
 
-        return fpo.FpoConfig(
+        config = fpo.FpoConfig(
             num_timesteps=self.num_timesteps,
             num_envs=self.num_envs,
             num_minibatches=self.num_minibatches,
@@ -123,6 +123,17 @@ class KaggleRunConfig:
             num_evals=self.num_evals,
             episode_length=self.episode_length,
         )
+        if config.loss_mode != "fpo":
+            raise ValueError(
+                "This runner is intended to use the exact FPO objective path, "
+                f"but got loss_mode={config.loss_mode!r}."
+            )
+        if config.reward_scaling != 10.0:
+            raise ValueError(
+                "This runner expects the repo FPO reward scaling baseline of 10.0, "
+                f"but got reward_scaling={config.reward_scaling}."
+            )
+        return config
 
 
 @dataclass(slots=True)
@@ -311,6 +322,10 @@ class GymnasiumBatchEnv:
         self.env_name = env_name
         self.num_envs = num_envs
         self._rng = np.random.default_rng(seed)
+        self._initial_reset_seeds = np.asarray(
+            [int(self._rng.integers(0, 2**31 - 1)) for _ in range(num_envs)],
+            dtype=np.int64,
+        )
         self.envs = [gym.make(env_name) for _ in range(num_envs)]
 
         action_space = self.envs[0].action_space
@@ -345,8 +360,8 @@ class GymnasiumBatchEnv:
 
     def reset(self) -> np.ndarray:
         obs_batch = []
-        for env in self.envs:
-            obs, _ = env.reset(seed=self._next_seed())
+        for env, reset_seed in zip(self.envs, self._initial_reset_seeds, strict=False):
+            obs, _ = env.reset(seed=int(reset_seed))
             obs_batch.append(self._format_obs(obs))
         self.current_obs = np.stack(obs_batch, axis=0)
         return self.current_obs.copy()
@@ -385,12 +400,21 @@ class GymnasiumBatchEnv:
         self.current_obs = next_obs_batch.copy()
         return next_obs_batch.copy(), rewards, terminated, truncated
 
-    def reset_where(self, reset_mask: np.ndarray) -> np.ndarray:
+    def reset_where(
+        self,
+        reset_mask: np.ndarray,
+        use_initial_seeds: bool = True,
+    ) -> np.ndarray:
         if self.current_obs is None:
             raise RuntimeError("Call reset() before reset_where().")
         for env_index, should_reset in enumerate(reset_mask):
             if should_reset:
-                obs, _ = self.envs[env_index].reset(seed=self._next_seed())
+                reset_seed = (
+                    int(self._initial_reset_seeds[env_index])
+                    if use_initial_seeds
+                    else self._next_seed()
+                )
+                obs, _ = self.envs[env_index].reset(seed=reset_seed)
                 self.current_obs[env_index] = self._format_obs(obs)
         return self.current_obs.copy()
 
@@ -1176,6 +1200,7 @@ def train_gymnasium_baseline(
             f"num_envs={run_config.num_envs}\n"
             f"num_timesteps={run_config.num_timesteps}\n"
             f"num_updates_per_batch={run_config.num_updates_per_batch}\n"
+            f"reward_scaling_for_gae={config.reward_scaling}\n"
             f"jax_backend={compute_backend}\n"
             f"jax_device={compute_device}"
         ),
@@ -1262,6 +1287,7 @@ def train_gymnasium_baseline(
             f"requested_num_timesteps={config.num_timesteps}\n"
             f"planned_total_timesteps={planned_total_timesteps}\n"
             f"num_updates_per_batch={config.num_updates_per_batch}\n"
+            f"reward_scaling_for_gae={config.reward_scaling}\n"
             f"eval_num_envs={run_config.eval_num_envs}\n"
             f"jax_backend={compute_backend}\n"
             "collecting first rollout next"
