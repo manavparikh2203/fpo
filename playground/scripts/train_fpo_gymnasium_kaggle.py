@@ -44,9 +44,10 @@ import numpy as np
 
 try:
     from IPython import get_ipython
-    from IPython.display import HTML, display
+    from IPython.display import HTML, Video, display
 except ImportError:  # pragma: no cover
     HTML = None
+    Video = None
     display = None
     get_ipython = None
 
@@ -74,13 +75,13 @@ class KaggleRunConfig:
 
     env_name: str = "Ant-v4"
     seed: int = 0
-    num_timesteps: int = 5000000
+    num_timesteps: int = 1000000
     num_envs: int = 128
     batch_size: int = 32
     num_minibatches: int = 8
     unroll_length: int = 30
-    num_updates_per_batch: int = 8
-    num_evals: int = 16
+    num_updates_per_batch: int = 16
+    num_evals: int = 32
     eval_num_envs: int = 4
     episode_length: int = 1000
     plot_every: int = 1
@@ -89,6 +90,10 @@ class KaggleRunConfig:
     show_live_plots: bool = True
     prefer_gpu_if_available: bool = True
     run_eval_at_step_zero: bool = True
+    save_final_plots: bool = True
+    save_final_video: bool = True
+    final_video_fps: int = 30
+    final_video_max_steps: int = 1000
     output_dir: str = str(REPO_ROOT / "kaggle_outputs" / "fpo_ant_v4")
 
     def make_fpo_config(self) -> fpo.FpoConfig:
@@ -775,12 +780,301 @@ def render_live_dashboard(
     plt.close(fig)
 
 
+def render_final_plots(
+    run_config: KaggleRunConfig,
+    config: fpo.FpoConfig,
+    train_history: list[dict[str, Any]],
+    eval_history: list[dict[str, Any]],
+    episode_history: list[dict[str, Any]],
+    live_display: LiveDisplayManager,
+    output_dir: Path,
+    elapsed_seconds: float,
+) -> dict[str, str]:
+    if not train_history:
+        return {}
+
+    timesteps_per_outer_iter = config.iterations_per_env * config.num_envs
+    train_outer_steps = np.asarray([row["step"] for row in train_history], dtype=np.int64)
+    train_env_steps = (train_outer_steps + 1) * timesteps_per_outer_iter
+    train_mean_reward = np.asarray(
+        [row["mean_step_reward"] for row in train_history],
+        dtype=np.float32,
+    )
+    train_mean_episode_return = np.asarray(
+        [row["mean_completed_episode_return"] for row in train_history],
+        dtype=np.float32,
+    )
+    train_mean_episode_length = np.asarray(
+        [row["mean_completed_episode_length"] for row in train_history],
+        dtype=np.float32,
+    )
+
+    eval_outer_steps = np.asarray([row["step"] for row in eval_history], dtype=np.int64)
+    eval_env_steps = eval_outer_steps * timesteps_per_outer_iter
+    eval_rewards = np.asarray(
+        [row["reward_mean"] for row in eval_history],
+        dtype=np.float32,
+    )
+    eval_lengths = np.asarray(
+        [row["steps_mean"] for row in eval_history],
+        dtype=np.float32,
+    )
+
+    episode_indices = np.asarray(
+        [row["episode_index"] for row in episode_history],
+        dtype=np.int32,
+    )
+    episode_returns = np.asarray(
+        [row["episode_return"] for row in episode_history],
+        dtype=np.float32,
+    )
+
+    dashboard_path = output_dir / "final_training_dashboard.png"
+    reward_plot_path = output_dir / "reward_return_vs_env_steps.png"
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    axes[0, 0].plot(train_env_steps, train_mean_reward, label="train mean step reward")
+    axes[0, 0].plot(
+        train_env_steps,
+        train_mean_episode_return,
+        label="train mean completed episode return",
+    )
+    if eval_history:
+        axes[0, 0].plot(
+            eval_env_steps,
+            eval_rewards,
+            marker="o",
+            label="eval mean episode return",
+        )
+    axes[0, 0].set_title("Reward And Return Vs Env Steps")
+    axes[0, 0].set_xlabel("env steps")
+    axes[0, 0].set_ylabel("reward")
+    axes[0, 0].legend()
+    axes[0, 0].grid(alpha=0.2)
+
+    if episode_history:
+        axes[0, 1].plot(
+            episode_indices,
+            episode_returns,
+            alpha=0.35,
+            label="per-episode return",
+        )
+        smoothed = moving_average(episode_returns, run_config.rolling_window)
+        smooth_x = episode_indices[-smoothed.size :]
+        axes[0, 1].plot(
+            smooth_x,
+            smoothed,
+            linewidth=2.0,
+            label=f"{run_config.rolling_window}-episode moving average",
+        )
+        axes[0, 1].legend()
+    else:
+        axes[0, 1].text(0.5, 0.5, "No completed episodes yet", ha="center", va="center")
+    axes[0, 1].set_title("Episode Return")
+    axes[0, 1].set_xlabel("episode index")
+    axes[0, 1].set_ylabel("return")
+    axes[0, 1].grid(alpha=0.2)
+
+    axes[1, 0].plot(
+        train_env_steps,
+        train_mean_episode_length,
+        label="train mean completed episode length",
+    )
+    if eval_history:
+        axes[1, 0].plot(
+            eval_env_steps,
+            eval_lengths,
+            marker="o",
+            label="eval mean episode length",
+        )
+    axes[1, 0].set_title("Episode Length Vs Env Steps")
+    axes[1, 0].set_xlabel("env steps")
+    axes[1, 0].set_ylabel("steps")
+    axes[1, 0].legend()
+    axes[1, 0].grid(alpha=0.2)
+
+    policy_loss = np.asarray(
+        [row["policy_loss"] for row in train_history],
+        dtype=np.float32,
+    )
+    value_loss = np.asarray(
+        [row["v_loss"] for row in train_history],
+        dtype=np.float32,
+    )
+    axes[1, 1].plot(train_env_steps, policy_loss, label="policy_loss")
+    axes[1, 1].plot(train_env_steps, value_loss, label="v_loss")
+    axes[1, 1].set_title("Optimization Vs Env Steps")
+    axes[1, 1].set_xlabel("env steps")
+    axes[1, 1].set_ylabel("loss")
+    axes[1, 1].legend()
+    axes[1, 1].grid(alpha=0.2)
+
+    fig.suptitle(
+        (
+            f"FPO baseline on {run_config.env_name} | "
+            f"final summary | elapsed {elapsed_seconds / 60.0:.1f} min"
+        ),
+        fontsize=14,
+    )
+    fig.tight_layout()
+    fig.savefig(dashboard_path, dpi=150, bbox_inches="tight")
+    live_display.update(
+        fig,
+        (
+            "training complete\n"
+            f"env={run_config.env_name}\n"
+            f"completed_episodes={len(episode_history)}\n"
+            f"final_dashboard={dashboard_path}\n"
+            f"output_dir={output_dir}"
+        ),
+    )
+    plt.close(fig)
+
+    reward_fig, reward_ax = plt.subplots(figsize=(11, 6))
+    reward_ax.plot(train_env_steps, train_mean_reward, label="train mean step reward")
+    reward_ax.plot(
+        train_env_steps,
+        train_mean_episode_return,
+        label="train mean completed episode return",
+    )
+    if eval_history:
+        reward_ax.plot(
+            eval_env_steps,
+            eval_rewards,
+            marker="o",
+            label="eval mean episode return",
+        )
+    reward_ax.set_title(f"Reward And Return Vs Env Steps | {run_config.env_name}")
+    reward_ax.set_xlabel("env steps")
+    reward_ax.set_ylabel("reward")
+    reward_ax.legend()
+    reward_ax.grid(alpha=0.2)
+    reward_fig.tight_layout()
+    reward_fig.savefig(reward_plot_path, dpi=150, bbox_inches="tight")
+    plt.close(reward_fig)
+
+    return {
+        "final_training_dashboard": str(dashboard_path),
+        "reward_return_vs_env_steps": str(reward_plot_path),
+    }
+
+
+def save_final_eval_video(
+    run_config: KaggleRunConfig,
+    agent_state: fpo.FpoState,
+    sample_action_fn: Any,
+    compute_device: jax.Device,
+    output_dir: Path,
+) -> dict[str, Any]:
+    try:
+        import imageio.v2 as imageio
+    except ImportError as exc:
+        return {
+            "status": "skipped",
+            "error": f"imageio not installed: {exc}",
+        }
+
+    video_env = gym.make(run_config.env_name, render_mode="rgb_array")
+    try:
+        obs, _ = video_env.reset(seed=run_config.seed + 20_000)
+        prng = jax.device_put(jax.random.key(run_config.seed + 20_000), compute_device)
+        frames: list[np.ndarray] = []
+        episode_return = 0.0
+        episode_steps = 0
+        done = False
+
+        while not done and episode_steps < run_config.final_video_max_steps:
+            frame = video_env.render()
+            if frame is not None:
+                frames.append(np.asarray(frame))
+
+            obs_batch = np.asarray(obs, dtype=np.float32).reshape(1, -1)
+            obs_jax = jax.device_put(jnp.asarray(obs_batch, dtype=jnp.float32), compute_device)
+            prng, step_key = jax.random.split(prng)
+            step_key = jax.device_put(step_key, compute_device)
+            action, _ = sample_action_fn(agent_state, obs_jax, step_key)
+            action_np = np.tanh(np.asarray(jax.device_get(action), dtype=np.float32))[0]
+            env_action = np.clip(
+                action_np.reshape(video_env.action_space.shape),
+                video_env.action_space.low,
+                video_env.action_space.high,
+            )
+            obs, reward, terminated, truncated, _ = video_env.step(env_action)
+            episode_return += float(reward)
+            episode_steps += 1
+            done = bool(terminated or truncated)
+
+        final_frame = video_env.render()
+        if final_frame is not None:
+            frames.append(np.asarray(final_frame))
+    finally:
+        video_env.close()
+
+    if not frames:
+        return {
+            "status": "skipped",
+            "error": "rendered video contained no frames",
+        }
+
+    video_path = output_dir / "final_policy_eval.mp4"
+    try:
+        imageio.mimsave(video_path, frames, fps=run_config.final_video_fps)
+        return {
+            "status": "saved",
+            "path": str(video_path),
+            "format": "mp4",
+            "episode_return": float(episode_return),
+            "episode_length": int(episode_steps),
+            "num_frames": len(frames),
+        }
+    except Exception as mp4_error:
+        gif_path = output_dir / "final_policy_eval.gif"
+        try:
+            imageio.mimsave(
+                gif_path,
+                frames,
+                format="GIF",
+                duration=1.0 / max(run_config.final_video_fps, 1),
+            )
+            return {
+                "status": "saved",
+                "path": str(gif_path),
+                "format": "gif",
+                "episode_return": float(episode_return),
+                "episode_length": int(episode_steps),
+                "num_frames": len(frames),
+                "mp4_error": str(mp4_error),
+            }
+        except Exception as gif_error:
+            return {
+                "status": "failed",
+                "error": f"mp4_error={mp4_error}; gif_error={gif_error}",
+                "episode_return": float(episode_return),
+                "episode_length": int(episode_steps),
+                "num_frames": len(frames),
+            }
+
+
+def display_final_video(video_info: dict[str, Any]) -> None:
+    if (
+        Video is None
+        or display is None
+        or not _is_notebook_runtime()
+        or video_info.get("status") != "saved"
+        or video_info.get("format") != "mp4"
+        or "path" not in video_info
+    ):
+        return
+    display(Video(video_info["path"], embed=True))
+
+
 def save_training_artifacts(
     run_config: KaggleRunConfig,
     train_history: list[dict[str, Any]],
     eval_history: list[dict[str, Any]],
     episode_history: list[dict[str, Any]],
     output_dir: Path,
+    extra_summary: dict[str, Any] | None = None,
 ) -> None:
     write_csv_rows(output_dir / "train_metrics.csv", train_history)
     write_csv_rows(output_dir / "eval_metrics.csv", eval_history)
@@ -794,6 +1088,8 @@ def save_training_artifacts(
         "final_train_row": train_history[-1] if train_history else None,
         "final_eval_row": eval_history[-1] if eval_history else None,
     }
+    if extra_summary is not None:
+        summary.update(extra_summary)
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2),
         encoding="utf-8",
@@ -1066,6 +1362,53 @@ def train_gymnasium_baseline(
                 )
     finally:
         train_env.close()
+
+    final_artifacts: dict[str, Any] = {}
+    if run_config.save_final_plots:
+        live_display.update_status(
+            f"training finished\nphase=saving_final_plots\noutput_dir={output_dir}"
+        )
+        final_artifacts["final_plots"] = render_final_plots(
+            run_config=run_config,
+            config=config,
+            train_history=train_history,
+            eval_history=eval_history,
+            episode_history=episode_history,
+            live_display=live_display,
+            output_dir=output_dir,
+            elapsed_seconds=time.time() - start_time,
+        )
+
+    if run_config.save_final_video:
+        live_display.update_status(
+            f"training finished\nphase=saving_final_video\noutput_dir={output_dir}"
+        )
+        final_artifacts["final_video"] = save_final_eval_video(
+            run_config=run_config,
+            agent_state=agent_state,
+            sample_action_fn=eval_sample_action_fn,
+            compute_device=compute_device,
+            output_dir=output_dir,
+        )
+        display_final_video(final_artifacts["final_video"])
+
+    save_training_artifacts(
+        run_config=run_config,
+        train_history=train_history,
+        eval_history=eval_history,
+        episode_history=episode_history,
+        output_dir=output_dir,
+        extra_summary=final_artifacts,
+    )
+    final_plots = final_artifacts.get("final_plots", {})
+    final_video = final_artifacts.get("final_video", {})
+    live_display.update_status(
+        "run complete\n"
+        f"output_dir={output_dir}\n"
+        f"final_dashboard={final_plots.get('final_training_dashboard', 'not_saved')}\n"
+        f"reward_plot={final_plots.get('reward_return_vs_env_steps', 'not_saved')}\n"
+        f"final_video={final_video.get('path', final_video.get('status', 'not_saved'))}"
+    )
 
     return agent_state, train_history, eval_history, episode_history
 
