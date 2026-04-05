@@ -1002,12 +1002,12 @@ def train_gymnasium_baseline(
                     "mean_step_reward": float(np.mean(reward_np)),
                     "mean_completed_episode_return": (
                         float(np.mean(batch_episode_returns))
-                        if batch_episode_returns
+                        if batch_episode_returns.size > 0
                         else float("nan")
                     ),
                     "mean_completed_episode_length": (
                         float(np.mean(batch_episode_lengths))
-                        if batch_episode_lengths
+                        if batch_episode_lengths.size > 0
                         else float("nan")
                     ),
                     "completed_episodes_in_iter": len(batch_episode_returns),
