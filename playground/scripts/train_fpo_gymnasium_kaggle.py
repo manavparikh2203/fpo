@@ -504,7 +504,7 @@ def gymnasium_eval_policy(
     sample_action_fn: Any,
     compute_device: jax.Device,
 ) -> dict[str, float]:
-    seed = int(np.asarray(jax.device_get(prng)).reshape(-1)[0])
+    seed = int(np.asarray(jax.device_get(jax.random.key_data(prng))).reshape(-1)[0])
     eval_env = GymnasiumBatchEnv(env_name, num_envs, seed=seed)
     try:
         rollout_state = GymnasiumBatchedRolloutState.init(eval_env, prng, num_envs)
