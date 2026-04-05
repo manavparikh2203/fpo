@@ -57,7 +57,19 @@ PLAYGROUND_SRC = REPO_ROOT / "playground" / "src"
 if str(PLAYGROUND_SRC) not in sys.path:
     sys.path.insert(0, str(PLAYGROUND_SRC))
 
-from flow_policy import fpo, rollouts
+try:
+    from flow_policy import fpo, rollouts
+except ModuleNotFoundError as exc:
+    if exc.name == "jax_dataclasses":
+        raise ModuleNotFoundError(
+            "Missing dependency 'jax_dataclasses'. In Kaggle, install the "
+            "playground package and dependencies with:\n"
+            "!pip install -e /kaggle/working/fpo/playground "
+            "\"gymnasium[mujoco]\" \"jax_dataclasses>=1.6.3\"\n"
+            "If you already ran pip in this notebook, rerun that cell and then "
+            "rerun this training cell."
+        ) from exc
+    raise
 
 
 SUPPORTED_GYMNASIUM_TASKS = (
