@@ -510,6 +510,22 @@ def render_placeholder_dashboard(
     plt.close(fig)
 
 
+def render_phase_progress(
+    run_config: KaggleRunConfig,
+    live_display: LiveDisplayManager,
+    output_dir: Path,
+    phase_title: str,
+    status_text: str,
+) -> None:
+    render_placeholder_dashboard(
+        run_config=run_config,
+        live_display=live_display,
+        output_dir=output_dir,
+        title_suffix=phase_title,
+        status_text=status_text,
+    )
+
+
 def render_live_dashboard(
     run_config: KaggleRunConfig,
     train_history: list[dict[str, Any]],
@@ -687,11 +703,11 @@ def train_gymnasium_baseline(
     output_dir = Path(run_config.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     live_display = LiveDisplayManager.create(enabled=run_config.show_live_plots)
-    render_placeholder_dashboard(
+    render_phase_progress(
         run_config=run_config,
         live_display=live_display,
         output_dir=output_dir,
-        title_suffix="Initializing",
+        phase_title="Initializing",
         status_text=(
             f"starting run for {run_config.env_name}\n"
             f"num_envs={run_config.num_envs}\n"
@@ -699,14 +715,44 @@ def train_gymnasium_baseline(
         ),
     )
 
+    render_phase_progress(
+        run_config=run_config,
+        live_display=live_display,
+        output_dir=output_dir,
+        phase_title="Creating Environments",
+        status_text=(
+            f"creating {run_config.num_envs} Gymnasium envs\n"
+            f"env={run_config.env_name}"
+        ),
+    )
     train_env = GymnasiumBatchEnv(
         env_name=run_config.env_name,
         num_envs=run_config.num_envs,
         seed=run_config.seed,
     )
+    render_phase_progress(
+        run_config=run_config,
+        live_display=live_display,
+        output_dir=output_dir,
+        phase_title="Resetting Environments",
+        status_text=(
+            f"resetting {run_config.num_envs} Gymnasium envs\n"
+            f"env={run_config.env_name}"
+        ),
+    )
     train_env.reset()
 
     tracker = EpisodeTracker.init(run_config.num_envs)
+    render_phase_progress(
+        run_config=run_config,
+        live_display=live_display,
+        output_dir=output_dir,
+        phase_title="Initializing Agent",
+        status_text=(
+            "building FPO state\n"
+            "compiling initial JAX functions"
+        ),
+    )
     agent_state = fpo.FpoState.init(
         prng=jax.random.key(run_config.seed),
         env=train_env,
@@ -722,11 +768,17 @@ def train_gymnasium_baseline(
             f"got {config.num_timesteps}."
         )
     eval_iters = set(np.linspace(0, outer_iters - 1, config.num_evals, dtype=int))
-    live_display.update_status(
-        f"initialized env and agent\n"
-        f"outer_iters={outer_iters}\n"
-        f"iterations_per_env={config.iterations_per_env}\n"
-        f"first dashboard update will appear after iteration 1"
+    render_phase_progress(
+        run_config=run_config,
+        live_display=live_display,
+        output_dir=output_dir,
+        phase_title="Ready To Train",
+        status_text=(
+            f"initialized env and agent\n"
+            f"outer_iters={outer_iters}\n"
+            f"iterations_per_env={config.iterations_per_env}\n"
+            "collecting first rollout next"
+        ),
     )
 
     train_history: list[dict[str, Any]] = []
@@ -737,11 +789,23 @@ def train_gymnasium_baseline(
     try:
         for outer_iter in range(outer_iters):
             if outer_iter in eval_iters:
-                live_display.update_status(
+                phase_status = (
                     f"iter {outer_iter + 1}/{outer_iters}\n"
                     f"phase=evaluation\n"
-                    f"env={run_config.env_name}"
+                    f"env={run_config.env_name}\n"
+                    f"eval_num_envs={run_config.eval_num_envs}\n"
+                    f"episode_length={config.episode_length}"
                 )
+                if not train_history:
+                    render_phase_progress(
+                        run_config=run_config,
+                        live_display=live_display,
+                        output_dir=output_dir,
+                        phase_title="Evaluating Policy",
+                        status_text=phase_status,
+                    )
+                else:
+                    live_display.update_status(phase_status)
                 eval_row = {
                     "step": outer_iter,
                     **evaluate_policy(
@@ -754,23 +818,45 @@ def train_gymnasium_baseline(
                 }
                 eval_history.append(eval_row)
 
-            live_display.update_status(
+            phase_status = (
                 f"iter {outer_iter + 1}/{outer_iters}\n"
                 f"phase=collect_rollout\n"
                 f"iterations_per_env={config.iterations_per_env}\n"
+                f"num_envs={run_config.num_envs}\n"
                 f"completed_episodes_total={len(episode_history)}"
             )
+            if not train_history:
+                render_phase_progress(
+                    run_config=run_config,
+                    live_display=live_display,
+                    output_dir=output_dir,
+                    phase_title="Collecting Rollout",
+                    status_text=phase_status,
+                )
+            else:
+                live_display.update_status(phase_status)
             transitions, prng, batch_episode_returns, batch_episode_lengths = collect_train_rollout(
                 env=train_env,
                 agent_state=agent_state,
                 prng=prng,
                 tracker=tracker,
             )
-            live_display.update_status(
+            phase_status = (
                 f"iter {outer_iter + 1}/{outer_iters}\n"
                 f"phase=training_step\n"
-                f"completed_episodes_total={len(episode_history)}"
+                f"completed_episodes_total={len(episode_history)}\n"
+                "running FPO update"
             )
+            if not train_history:
+                render_phase_progress(
+                    run_config=run_config,
+                    live_display=live_display,
+                    output_dir=output_dir,
+                    phase_title="Applying FPO Update",
+                    status_text=phase_status,
+                )
+            else:
+                live_display.update_status(phase_status)
             agent_state, metrics = agent_state.training_step(transitions)
 
             reward_np = np.asarray(jax.device_get(transitions.reward), dtype=np.float32)
