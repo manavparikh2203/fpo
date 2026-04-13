@@ -86,7 +86,7 @@ SUPPORTED_GYMNASIUM_TASKS = (
 class KaggleRunConfig:
     """Run config for a notebook-friendly Gymnasium FPO baseline."""
 
-    env_name: str = "Walker2d-v4"
+    env_name: str = "Hopper-v4"
     seed: int = 0
     num_timesteps: int = 10000000
     num_envs: int = 32
