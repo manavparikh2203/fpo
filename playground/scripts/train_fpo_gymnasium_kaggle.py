@@ -107,6 +107,7 @@ class KaggleRunConfig:
     save_final_video: bool = True
     final_video_fps: int = 30
     final_video_max_steps: int = 5000
+    reward_scaling_override: float | None = None
     require_exact_num_timesteps: bool = False
     output_dir: str | None = None
 
@@ -114,6 +115,13 @@ class KaggleRunConfig:
         if self.output_dir is None:
             env_slug = self.env_name.lower().replace("-", "_")
             self.output_dir = str(REPO_ROOT / "kaggle_outputs" / f"fpo_{env_slug}")
+
+    def effective_reward_scaling(self) -> float:
+        if self.reward_scaling_override is not None:
+            return float(self.reward_scaling_override)
+        if self.env_name == "Humanoid-v4":
+            return 1.0
+        return 10.0
 
     def make_fpo_config(self) -> fpo.FpoConfig:
         if self.env_name not in SUPPORTED_GYMNASIUM_TASKS:
@@ -140,16 +148,19 @@ class KaggleRunConfig:
             num_updates_per_batch=self.num_updates_per_batch,
             num_evals=self.num_evals,
             episode_length=self.episode_length,
+            reward_scaling=self.effective_reward_scaling(),
         )
         if config.loss_mode != "fpo":
             raise ValueError(
                 "This runner is intended to use the exact FPO objective path, "
                 f"but got loss_mode={config.loss_mode!r}."
             )
-        if config.reward_scaling != 10.0:
+        expected_reward_scaling = self.effective_reward_scaling()
+        if config.reward_scaling != expected_reward_scaling:
             raise ValueError(
-                "This runner expects the repo FPO reward scaling baseline of 10.0, "
-                f"but got reward_scaling={config.reward_scaling}."
+                "This runner expects the configured reward scaling baseline, "
+                f"but got reward_scaling={config.reward_scaling} instead of "
+                f"{expected_reward_scaling}."
             )
         return config
 
