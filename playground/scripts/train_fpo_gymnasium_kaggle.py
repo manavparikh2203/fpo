@@ -1205,7 +1205,7 @@ def train_gymnasium_baseline(
     )
     rollout_state = GymnasiumBatchedRolloutState.init(
         train_env,
-        jax.device_put(jax.random.key(run_config.seed + 1), compute_device),
+        jax.device_put(jax.random.key(run_config.seed), compute_device),
         run_config.num_envs,
     )
     render_phase_progress(
@@ -1300,7 +1300,7 @@ def train_gymnasium_baseline(
                         agent_state=agent_state,
                         env_name=run_config.env_name,
                         prng=jax.device_put(
-                            jax.random.key(run_config.seed + 10_000 + outer_iter),
+                            jax.random.fold_in(agent_state.prng, outer_iter),
                             compute_device,
                         ),
                         num_envs=run_config.eval_num_envs,
