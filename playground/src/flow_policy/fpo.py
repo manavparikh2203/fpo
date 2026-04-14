@@ -53,6 +53,7 @@ class FpoConfig:
     num_updates_per_batch: jdc.Static[int] = 16
     reward_scaling: float = 10.0
     unroll_length: jdc.Static[int] = 30
+    max_grad_norm: jdc.Static[float | None] = None
 
     gae_lambda: float = 0.95
     normalize_advantage: jdc.Static[bool] = True
@@ -140,7 +141,13 @@ class FpoState:
         network_params = FpoParams(actor_net, critic_net)
 
         # We'll manage learning rate ourselves!
-        opt = optax.scale_by_adam()
+        if config.max_grad_norm is None:
+            opt = optax.scale_by_adam()
+        else:
+            opt = optax.chain(
+                optax.clip_by_global_norm(config.max_grad_norm),
+                optax.scale_by_adam(),
+            )
         return FpoState(
             env=env,
             config=config,

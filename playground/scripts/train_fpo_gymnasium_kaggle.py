@@ -88,17 +88,17 @@ class KaggleRunConfig:
 
     env_name: str = "Hopper-v4"
     seed: int = 0
-    num_timesteps: int = 10000000
+    num_timesteps: int = 1000000
     num_envs: int = 32
     batch_size: int = 1024
     num_minibatches: int = 1
     unroll_length: int = 25
     num_updates_per_batch: int = 16
-    num_evals: int = 64
+    num_evals: int = 10
     eval_num_envs: int = 4
     episode_length: int = 1000
-    plot_every: int = 1
-    save_every: int = 1
+    plot_every: int = 10
+    save_every: int = 10
     rolling_window: int = 20
     show_live_plots: bool = True
     prefer_gpu_if_available: bool = True
@@ -108,6 +108,7 @@ class KaggleRunConfig:
     final_video_fps: int = 30
     final_video_max_steps: int = 5000
     reward_scaling_override: float | None = None
+    max_grad_norm_override: float | None = None
     require_exact_num_timesteps: bool = False
     output_dir: str | None = None
 
@@ -122,6 +123,13 @@ class KaggleRunConfig:
         if self.env_name == "Humanoid-v4":
             return 1.0
         return 10.0
+
+    def effective_max_grad_norm(self) -> float | None:
+        if self.max_grad_norm_override is not None:
+            return float(self.max_grad_norm_override)
+        if self.env_name == "Humanoid-v4":
+            return 1.0
+        return None
 
     def make_fpo_config(self) -> fpo.FpoConfig:
         if self.env_name not in SUPPORTED_GYMNASIUM_TASKS:
@@ -149,6 +157,7 @@ class KaggleRunConfig:
             num_evals=self.num_evals,
             episode_length=self.episode_length,
             reward_scaling=self.effective_reward_scaling(),
+            max_grad_norm=self.effective_max_grad_norm(),
         )
         if config.loss_mode != "fpo":
             raise ValueError(
@@ -1184,6 +1193,7 @@ def train_gymnasium_baseline(
             f"num_timesteps={run_config.num_timesteps}\n"
             f"num_updates_per_batch={run_config.num_updates_per_batch}\n"
             f"reward_scaling_for_gae={config.reward_scaling}\n"
+            f"max_grad_norm={config.max_grad_norm}\n"
             f"jax_backend={compute_backend}\n"
             f"jax_device={compute_device}"
         ),
@@ -1271,6 +1281,7 @@ def train_gymnasium_baseline(
             f"planned_total_timesteps={planned_total_timesteps}\n"
             f"num_updates_per_batch={config.num_updates_per_batch}\n"
             f"reward_scaling_for_gae={config.reward_scaling}\n"
+            f"max_grad_norm={config.max_grad_norm}\n"
             f"eval_num_envs={run_config.eval_num_envs}\n"
             f"jax_backend={compute_backend}\n"
             "collecting first rollout next"
