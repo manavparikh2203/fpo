@@ -88,7 +88,7 @@ class KaggleRunConfig:
 
     env_name: str = "Hopper-v4"
     seed: int = 0
-    num_timesteps: int = 1000000
+    num_timesteps: int = 5000000
     num_envs: int = 32
     batch_size: int = 1024
     num_minibatches: int = 1
@@ -97,8 +97,8 @@ class KaggleRunConfig:
     num_evals: int = 10
     eval_num_envs: int = 4
     episode_length: int = 1000
-    plot_every: int = 10
-    save_every: int = 10
+    plot_every: int = 20
+    save_every: int = 20
     rolling_window: int = 20
     show_live_plots: bool = True
     prefer_gpu_if_available: bool = True
