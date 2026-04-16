@@ -1154,6 +1154,26 @@ def save_training_artifacts(
     write_csv_rows(output_dir / "train_metrics.csv", train_history)
     write_csv_rows(output_dir / "eval_metrics.csv", eval_history)
     write_csv_rows(output_dir / "episode_metrics.csv", episode_history)
+    write_csv_rows(
+        output_dir / "episode_returns.csv",
+        [
+            {
+                "env_steps": row["env_steps"],
+                "episode_return": row["episode_return"],
+            }
+            for row in episode_history
+        ],
+    )
+    write_csv_rows(
+        output_dir / "episode_length_vs_steps.csv",
+        [
+            {
+                "env_steps": row["env_steps"],
+                "episode_length": row["episode_length"],
+            }
+            for row in episode_history
+        ],
+    )
 
     summary = {
         "run_config": dataclasses.asdict(run_config),
@@ -1162,6 +1182,8 @@ def save_training_artifacts(
         "num_completed_episodes": len(episode_history),
         "final_train_row": train_history[-1] if train_history else None,
         "final_eval_row": eval_history[-1] if eval_history else None,
+        "episode_returns_csv": str(output_dir / "episode_returns.csv"),
+        "episode_length_vs_steps_csv": str(output_dir / "episode_length_vs_steps.csv"),
     }
     if extra_summary is not None:
         summary.update(extra_summary)
