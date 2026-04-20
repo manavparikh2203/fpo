@@ -86,7 +86,7 @@ SUPPORTED_GYMNASIUM_TASKS = (
 class KaggleRunConfig:
     """Run config for a notebook-friendly Gymnasium FPO baseline."""
 
-    env_name: str = "Ant-v4"
+    env_name: str = "Humanoid-v4"
     seed: int = 0
     num_timesteps: int = 5000000
     num_envs: int = 32
@@ -176,44 +176,51 @@ class KaggleRunConfig:
 
 @dataclass(slots=True)
 class TrainEpisodeTracker:
-    """Tracks episode returns and lengths across rollout chunks for logging."""
+    """Tracks completed train episodes with cumulative env-step timestamps."""
 
     returns: np.ndarray
     lengths: np.ndarray
+    total_env_steps: int = 0
 
     @classmethod
     def init(cls, num_envs: int) -> "TrainEpisodeTracker":
         return cls(
             returns=np.zeros(num_envs, dtype=np.float32),
             lengths=np.zeros(num_envs, dtype=np.int32),
+            total_env_steps=0,
         )
 
     def update_from_transitions(
         self,
         transitions: rollouts.TransitionStruct[Any],
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         rewards = np.asarray(jax.device_get(transitions.reward), dtype=np.float32)
         truncation = np.asarray(jax.device_get(transitions.truncation), dtype=np.float32)
         discount = np.asarray(jax.device_get(transitions.discount), dtype=np.float32)
 
         completed_returns: list[float] = []
         completed_lengths: list[int] = []
+        completed_env_steps: list[int] = []
         horizon, _ = rewards.shape
+        num_envs = rewards.shape[1]
 
         for t in range(horizon):
             self.returns += rewards[t]
             self.lengths += 1
+            self.total_env_steps += num_envs
             done = np.logical_or(truncation[t] > 0.5, discount[t] == 0.0)
             if not bool(done.any()):
                 continue
             completed_returns.extend(self.returns[done].astype(np.float32).tolist())
             completed_lengths.extend(self.lengths[done].astype(np.int32).tolist())
+            completed_env_steps.extend([self.total_env_steps] * int(np.count_nonzero(done)))
             self.returns[done] = 0.0
             self.lengths[done] = 0
 
         return (
             np.asarray(completed_returns, dtype=np.float32),
             np.asarray(completed_lengths, dtype=np.int32),
+            np.asarray(completed_env_steps, dtype=np.int64),
         )
 
 
@@ -720,12 +727,8 @@ def create_dashboard_figure(
         dtype=np.int64,
     )
 
-    train_mean_episode_return = np.asarray(
-        [row["mean_completed_episode_return"] for row in train_history],
-        dtype=np.float32,
-    )
-    train_mean_episode_length = np.asarray(
-        [row["mean_completed_episode_length"] for row in train_history],
+    episode_lengths = np.asarray(
+        [row["episode_length"] for row in episode_history],
         dtype=np.float32,
     )
     eval_rewards = np.asarray(
@@ -746,8 +749,8 @@ def create_dashboard_figure(
         ax_episode_return,
         episode_env_steps,
         episode_returns,
-        title="sample/episode_return",
-        xlabel="Step",
+        title="sample/episode_return_vs_env_steps",
+        xlabel="Env steps",
         ylabel="return",
         rolling_window=run_config.rolling_window,
         raw_label="per-episode return",
@@ -760,14 +763,14 @@ def create_dashboard_figure(
     ax_episode_length = fig.add_subplot(layout[0, 3:])
     plot_metric_panel(
         ax_episode_length,
-        train_env_steps,
-        train_mean_episode_length,
-        title="sample/episode_length",
-        xlabel="Step",
+        episode_env_steps,
+        episode_lengths,
+        title="sample/episode_length_vs_env_steps",
+        xlabel="Env steps",
         ylabel="steps",
         rolling_window=run_config.rolling_window,
-        raw_label="train completed episode length",
-        smooth_label=f"{run_config.rolling_window}-step average",
+        raw_label="per-episode length",
+        smooth_label=f"{run_config.rolling_window}-episode average",
         eval_x=eval_env_steps,
         eval_y=eval_lengths,
         eval_label="eval mean length",
@@ -800,7 +803,7 @@ def create_dashboard_figure(
             train_env_steps,
             metric_values,
             title=title,
-            xlabel="Step",
+            xlabel="Env steps",
             ylabel=ylabel,
             rolling_window=max(run_config.rolling_window, 10),
             raw_label=metric_key,
@@ -940,7 +943,8 @@ def render_final_plots(
         return {}
 
     dashboard_path = output_dir / "final_training_dashboard.png"
-    reward_plot_path = output_dir / "reward_return_vs_env_steps.png"
+    episode_return_plot_path = output_dir / "episode_return_vs_env_steps.png"
+    episode_length_plot_path = output_dir / "episode_length_vs_env_steps.png"
 
     fig = create_dashboard_figure(
         run_config=run_config,
@@ -978,36 +982,69 @@ def render_final_plots(
         ],
         dtype=np.int64,
     )
-    train_mean_episode_return = np.asarray(
-        [row["mean_completed_episode_return"] for row in train_history],
+    episode_env_steps = np.asarray(
+        [row["env_steps"] for row in episode_history],
+        dtype=np.int64,
+    )
+    episode_returns = np.asarray(
+        [row["episode_return"] for row in episode_history],
+        dtype=np.float32,
+    )
+    episode_lengths = np.asarray(
+        [row["episode_length"] for row in episode_history],
         dtype=np.float32,
     )
     eval_rewards = np.asarray(
         [row["reward_mean"] for row in eval_history],
         dtype=np.float32,
     )
+    eval_lengths = np.asarray(
+        [row["steps_mean"] for row in eval_history],
+        dtype=np.float32,
+    )
     reward_fig, reward_ax = plt.subplots(figsize=(12, 6))
     plot_metric_panel(
         reward_ax,
-        train_env_steps,
-        train_mean_episode_return,
-        title=f"sample/episode_return | {run_config.env_name}",
-        xlabel="Step",
+        episode_env_steps,
+        episode_returns,
+        title=f"sample/episode_return_vs_env_steps | {run_config.env_name}",
+        xlabel="Env steps",
         ylabel="return",
         rolling_window=run_config.rolling_window,
-        raw_label="train completed episode return",
-        smooth_label=f"{run_config.rolling_window}-window return",
+        raw_label="per-episode return",
+        smooth_label=f"{run_config.rolling_window}-episode average",
         eval_x=eval_env_steps,
         eval_y=eval_rewards,
         eval_label="eval mean return",
     )
     reward_fig.tight_layout()
-    reward_fig.savefig(reward_plot_path, dpi=150, bbox_inches="tight")
+    reward_fig.savefig(episode_return_plot_path, dpi=150, bbox_inches="tight")
     plt.close(reward_fig)
+
+    length_fig, length_ax = plt.subplots(figsize=(12, 6))
+    plot_metric_panel(
+        length_ax,
+        episode_env_steps,
+        episode_lengths,
+        title=f"sample/episode_length_vs_env_steps | {run_config.env_name}",
+        xlabel="Env steps",
+        ylabel="steps",
+        rolling_window=run_config.rolling_window,
+        raw_label="per-episode length",
+        smooth_label=f"{run_config.rolling_window}-episode average",
+        eval_x=eval_env_steps,
+        eval_y=eval_lengths,
+        eval_label="eval mean length",
+    )
+    length_fig.tight_layout()
+    length_fig.savefig(episode_length_plot_path, dpi=150, bbox_inches="tight")
+    plt.close(length_fig)
 
     return {
         "final_training_dashboard": str(dashboard_path),
-        "reward_return_vs_env_steps": str(reward_plot_path),
+        "episode_return_vs_env_steps": str(episode_return_plot_path),
+        "episode_length_vs_env_steps": str(episode_length_plot_path),
+        "reward_return_vs_env_steps": str(episode_return_plot_path),
     }
 
 
@@ -1158,7 +1195,10 @@ def save_training_artifacts(
         output_dir / "episode_returns.csv",
         [
             {
+                "episode_index": row["episode_index"],
+                "outer_iter": row["outer_iter"],
                 "env_steps": row["env_steps"],
+                "outer_iter_end_env_steps": row["outer_iter_end_env_steps"],
                 "episode_return": row["episode_return"],
             }
             for row in episode_history
@@ -1168,7 +1208,10 @@ def save_training_artifacts(
         output_dir / "episode_length_vs_steps.csv",
         [
             {
+                "episode_index": row["episode_index"],
+                "outer_iter": row["outer_iter"],
                 "env_steps": row["env_steps"],
+                "outer_iter_end_env_steps": row["outer_iter_end_env_steps"],
                 "episode_length": row["episode_length"],
             }
             for row in episode_history
@@ -1184,6 +1227,7 @@ def save_training_artifacts(
         "final_eval_row": eval_history[-1] if eval_history else None,
         "episode_returns_csv": str(output_dir / "episode_returns.csv"),
         "episode_length_vs_steps_csv": str(output_dir / "episode_length_vs_steps.csv"),
+        "episode_metrics_csv": str(output_dir / "episode_metrics.csv"),
     }
     if extra_summary is not None:
         summary.update(extra_summary)
@@ -1339,6 +1383,7 @@ def train_gymnasium_baseline(
                     live_display.update_status(phase_status)
                 eval_row = {
                     "step": outer_iter,
+                    "outer_iter": outer_iter,
                     "env_steps": outer_iter * timesteps_per_outer_iter,
                     **gymnasium_eval_policy(
                         agent_state=agent_state,
@@ -1398,25 +1443,31 @@ def train_gymnasium_baseline(
                 live_display.update_status(phase_status)
             agent_state, metrics = agent_state.training_step(transitions)
 
-            batch_episode_returns, batch_episode_lengths = train_episode_tracker.update_from_transitions(
-                transitions
-            )
+            (
+                batch_episode_returns,
+                batch_episode_lengths,
+                batch_episode_env_steps,
+            ) = train_episode_tracker.update_from_transitions(transitions)
             reward_np = np.asarray(jax.device_get(transitions.reward), dtype=np.float32)
             metric_means = {
                 key: float(np.asarray(jax.device_get(value)).mean())
                 for key, value in metrics.items()
             }
 
-            for episode_return, episode_length in zip(
+            for episode_return, episode_length, episode_env_steps in zip(
                 batch_episode_returns,
                 batch_episode_lengths,
+                batch_episode_env_steps,
                 strict=False,
             ):
                 episode_history.append(
                     {
                         "episode_index": len(episode_history),
                         "outer_iter": outer_iter,
-                        "env_steps": (outer_iter + 1) * timesteps_per_outer_iter,
+                        # Use the true cumulative env step when the episode ended,
+                        # not just the end of the enclosing outer iteration.
+                        "env_steps": int(episode_env_steps),
+                        "outer_iter_end_env_steps": (outer_iter + 1) * timesteps_per_outer_iter,
                         "episode_return": float(episode_return),
                         "episode_length": int(episode_length),
                     }
@@ -1425,6 +1476,7 @@ def train_gymnasium_baseline(
             train_history.append(
                 {
                     "step": outer_iter,
+                    "outer_iter": outer_iter,
                     "env_steps": (outer_iter + 1) * timesteps_per_outer_iter,
                     "elapsed_seconds": float(time.time() - start_time),
                     "mean_step_reward": float(np.mean(reward_np)),
