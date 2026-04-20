@@ -91,11 +91,11 @@ class KaggleRunConfig:
     num_timesteps: int = 5000000
     num_envs: int = 32
     batch_size: int = 1024
-    num_minibatches: int = 1
-    unroll_length: int = 25
+    num_minibatches: int = 32
+    unroll_length: int = 30
     num_updates_per_batch: int = 16
     num_evals: int = 10
-    eval_num_envs: int = 4
+    eval_num_envs: int = 2048
     episode_length: int = 1000
     plot_every: int = 20
     save_every: int = 20
